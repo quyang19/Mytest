@@ -25,7 +25,7 @@ int main()
 {
     #if 0
     myClass<int,int> class1(3,5);
-    
+
     class1.show();
     
     myClass<int,char> class2(3,'a');
@@ -38,11 +38,13 @@ int main()
     #endif
     
     vector<int> vecIntA(3);
+    char array[5]={'1','2','3','4','5'};
     //打印vectorA,此处也可以用下面注释内的代码来输出vector中的数据
     for(int i=0;i<vecIntA.size();i++)
     {
         cout<<vecIntA[i]<<"     ";
     }
+    strlen(array);
     vector<Foo> f(2);
     
 }
