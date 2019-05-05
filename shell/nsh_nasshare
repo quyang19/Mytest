@@ -1,0 +1,2570 @@
+#!/bin/sh
+################################################################################
+# * Filename    : nsh_nasshare
+# * Description : nasshare list/info/modify/create/delete script.
+# * Created on  : 2010-09-08
+# *
+# * (C) Copyright Toyou feiji Technology Inc., 2010
+# * All Rights Reserved
+################################################################################
+
+WHICH="/usr/bin/which"
+FIND="`$WHICH find`"
+ECHO="`$WHICH echo`"
+CAT="`$WHICH cat`"
+TOUCH="`$WHICH touch`"
+
+GREP="/bin/grep"
+MKDIR="/bin/mkdir"
+CHMOD="/bin/chmod"
+MV="/bin/mv"
+RM="/bin/rm"
+MOUNT="/bin/mount"
+UMOUNT="/bin/umount"
+EXPORTFS="/usr/sbin/exportfs"
+SMBCONTROL="/usr/bin/smbcontrol"
+
+NSH_EVENT="/sansoft/sw/script/nsh_event"
+SW_CONF_PATH="/sansoft/conf/sw"
+SW_SCRIPT_PATH="/sansoft/sw/script"
+NSH_NASUSER="${SW_SCRIPT_PATH}/nsh_nasuser"
+NSH_NASGROUP="${SW_SCRIPT_PATH}/nsh_nasgroup"
+NSH_LVM="${SW_SCRIPT_PATH}/nsh_lvm"
+
+CFG_FILE="/sansoft/sw/bin/cfgfile"
+SMB="/etc/init.d/smb"
+NFS="/etc/init.d/nfs"
+FTP="/etc/init.d/ftp"
+VOL_MNT_PT="/pools"
+NAS_MNT_PNT="/shares"
+FTP_ANONYMOUS_PATH="/ftp/pub"
+FTP_USER_PATH="/ftp/shares"
+NAS_SHARES="${SW_CONF_PATH}/nas/nasshares/"
+SMB_SHARES="${SW_CONF_PATH}/nas/smbshares/"
+FTP_SHARES="${SW_CONF_PATH}/nas/ftpshares/"
+RSYNC_SECRETS="${SW_CONF_PATH}/nas/rsyncsecrets/"
+NAS_PROTOCOLS_SMB_SHARES="${SW_CONF_PATH}/nas/nasprotocols/smb_shares.conf"
+NAS_PROTOCOLS_NFS_EXPORTS="${SW_CONF_PATH}/nas/nasprotocols/nfs_exports"
+NAS_PROTOCOLS_FTP_ANONY_SHARES="${SW_CONF_PATH}/nas/nasprotocols/ftp_anonyshares.conf"
+NAS_PROTOCOLS_FTP_USER_SHARES="${SW_CONF_PATH}/nas/nasprotocols/ftp_usershares.conf"
+NAS_SERVICES_SMB="${SW_CONF_PATH}/nas/nasservices/smb"
+NAS_SERVICES_NFS="${SW_CONF_PATH}/nas/nasservices/nfs"
+NAS_SERVICES_FTP="${SW_CONF_PATH}/nas/nasservices/ftp"
+NAS_SERVICES_RSYNC="${SW_CONF_PATH}/nas/nasservices/rsync"
+RSYNC_CONF="/netstor/conf/sw/nas/nasprotocols/rsyncd.conf"
+AUTH_CONF_PATH="${SW_CONF_PATH}/nas/nassettings/auth"
+AUTH_CONF_FILE="${SW_CONF_PATH}/nas/nassettings/auth_settings.conf"
+CLUSTER_CONF="${SW_CONF_PATH}/cluster/cluster.conf"
+
+FTP_MODE_ANONYMOUS="anony"
+FTP_MODE_USER="user"
+NAS_SHARE_EXIST=141
+NAS_SHARE_MAXIMUM=142
+FTP_MOUNT_FAILED=164
+FTP_UMOUNT_FAILED=164
+
+#. $SW_SCRIPT_PATH/nsh_libconfig
+#. $SW_SCRIPT_PATH/nsh_libcommon
+
+help()
+{
+    local program=`basename "$0"`
+    cat <<EOF
+$program usage:
+    $program list [-v]
+    $program info sharename
+    $program create sharename lvuuid settings
+    $program delete sharename
+    $program mkconf protocolname [sharename]
+    $program rmconf protocolname [sharename]
+    $program modify sharename settings
+    $program getaccess protocolname sharename
+    $program setaccess protocolname sharename settings
+    $program enable sharename [protocolname]
+    $program disable sharename [protocolname]
+    $program active sharename [protocolname]
+    $program inactive sharename [protocolname]    
+    $program deleteuser username
+    $program deletegroup groupname
+EOF
+}
+
+# --- private routine section --------------------------------------------
+
+nasshare_mknasconf()
+{
+    local exit=0
+    local sharename="$1"
+    local poolname="$2"
+    local sharefile="$NAS_SHARES${poolname}-${sharename}"
+    local mountpath="$VOL_MNT_PT/$poolname/$sharename"
+    local sharecomment=""
+
+    if [ -f "$sharefile" ]; then
+        return 1
+    fi
+
+    #if [ ! -d "$mountpath" ]; then
+    #    return 1
+    #fi
+
+    if [ $exit = 0 ]; then
+        ${TOUCH} $sharefile &&
+        chmod 666 $sharefile &&
+        cat >$sharefile <<EOF
+VER=1.0
+POOLNAME=$poolname
+DATASET=$poolname/$sharename
+PATH=$VOL_MNT_PT/$poolname/$sharename
+COMMENT=$sharecomment
+ACTIVE=1
+SMB=1
+NFS=1
+FTP=0
+AFP=0
+RSYNC=0
+NDMP=0
+HTTP=0
+
+[SMB]
+RO=0
+WRITE_IP=
+VISIBLE=1
+ACCESS=0
+ALLOW_USERS=
+ALLOW_GROUPS=
+LARGE_DIR=0
+
+[NFS]
+ACCESS_IP=
+WRITE_IP=
+INSECURE=0
+SYNCHRONOUS=0
+INSECURE_LOCKS=0
+ALL_SQUASH=0
+NO_ROOT_SQUASH=1
+
+[FTP]
+MODE=${FTP_MODE_ANONYMOUS}
+ANONYMOUS_ALLOW=
+ANONYMOUS_WRITE=
+ALLOW_USERS=
+ALLOW_GROUPS=
+
+[AFP]
+RO=0
+ACCESS=1
+BD=BDB
+ALLOW_USERS=
+ALLOW_GROUPS=
+
+[RSYNC]
+ANONYMOU=
+RO=
+ALLOW_USERS=
+ACCESS_IP=
+LIST=
+
+[HTTP]
+HTTP_ACCESS=0
+EOF
+
+        exit=$?
+    fi
+
+    return $exit
+}
+
+nasshare_rmnasconf()
+{
+    local exit=0
+    local sharename="$1"
+    local poolname="$2"
+    local sharefile="$NAS_SHARES${poolname}-${sharename}"
+
+    if [ -f ${sharefile} ]; then
+        ${RM} -f $sharefile
+        exit=$?
+    fi
+
+    return $exit
+}
+
+nasusers2smbusers()
+{
+    if [ -z "$1" ];then
+        return 1
+    fi
+
+    local delimeter=","
+    echo "$1" | awk -F "," -v delimeter="$delimeter" 'BEGIN{ORS=delimeter;} {for(i=1; i<=NF; i++)print "\""$i"\"";}' | sed 's/,$/\n/'
+}
+
+nasgroups2smbgroups()
+{
+    if [ -z "$1" ];then
+        return 1
+    fi
+
+    local delimeter=","
+    echo "$1" | awk -F "," -v delimeter="$delimeter" 'BEGIN{ORS=delimeter;} {for(i=1; i<=NF; i++)print "\"@"$i"\"";}' | sed 's/,$/\n/'
+}
+
+nasshare_checknassharesexceed()
+{
+    local exit=0
+    local nassharesdir="${NAS_SHARES}"
+    local nassharescount=0
+
+    if [ -d $nassharesdir ]; then
+        nassharescount="`find ${nassharesdir} -type f | wc -l`"
+        if [ $nassharescount -ge $MAX_NAS_SHARES ]; then
+            exit=1
+        fi
+    fi
+
+    return $exit
+}
+
+nasshare_checkexist()
+{
+    local sharename="$1"
+    local poolname="$2"
+    # ignore case distinctions
+    if [ -n "`ls \"${NAS_SHARES}\" | ${GREP} -iw \"$poolname-$sharename\"`" ]; then
+        echo 1
+    else
+        echo 0
+    fi
+}
+
+nasshare_mountftpshare()
+{
+    local exit=0
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    
+    local SHARE="${poolname}-${sharename}"
+    local SHARE_PATH="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" PATH`"
+    local mode=`${CFG_FILE} get_var ${NAS_SHARES}${SHARE} MODE FTP`
+    
+    [ ! -d "${SHARE_PATH}" ] && return $exit
+    
+    if [ "$mode" = "$FTP_MODE_ANONYMOUS" ]; then
+        if [ -z "`${MOUNT} | awk -v shareMountPoint=\"${FTP_ANONYMOUS_PATH}/${SHARE}\" '{if($3==shareMountPoint) print $3;}'`" ]; then
+            if [ -n "`${MOUNT} | awk -v shareMountPoint=\"${FTP_USER_PATH}/${SHARE}\" '{if($3==shareMountPoint) print $3;}'`" ]; then
+                ${UMOUNT} ${FTP_USER_PATH}/${SHARE}
+                if [ "$?" -eq 0 ]; then
+                    rm -rf ${FTP_USER_PATH}/${SHARE}
+                else
+                    exit=$FTP_UMOUNT_FAILED
+                    continue
+                fi
+                
+            fi
+            if [ ! -d "${FTP_ANONYMOUS_PATH}/${SHARE}" ]; then
+                ${MKDIR} -p "${FTP_ANONYMOUS_PATH}/${SHARE}"
+            fi
+            ${MOUNT} --bind "${SHARE_PATH}" "${FTP_ANONYMOUS_PATH}/${SHARE}"
+            exit=$?
+            if [ "$exit" -ne 0 ]; then
+                nasshare_rmconfftp "${SHARE}"
+                return $FTP_MOUNT_FAILED
+            fi
+        fi
+    elif [ "$mode" = "$FTP_MODE_USER" ]; then
+        if [ -z "`${MOUNT} | awk -v shareMountPoint=\"${FTP_USER_PATH}/${SHARE}\" '{if($3==shareMountPoint) print $3;}'`" ]; then
+            if [ -n "`${MOUNT} | awk -v shareMountPoint=\"${FTP_ANONYMOUS_PATH}/${SHARE}\" '{if($3==shareMountPoint) print $3;}'`" ]; then
+                ${UMOUNT} ${FTP_ANONYMOUS_PATH}/${SHARE}
+                if [ "$?" -eq 0 ]; then
+                    rm -rf ${FTP_ANONYMOUS_PATH}/${SHARE}
+                else
+                    exit=$FTP_UMOUNT_FAILED
+                    continue
+                fi
+
+            fi
+            if [ ! -d "${FTP_USER_PATH}/${SHARE}" ]; then
+                ${MKDIR} -p "${FTP_USER_PATH}/${SHARE}"
+            fi
+            ${MOUNT} --bind "${SHARE_PATH}" "${FTP_USER_PATH}/${SHARE}"
+            exit=$?
+            if [ "$exit" -ne 0 ]; then
+                nasshare_rmconfftp "${SHARE}"
+                return $FTP_MOUNT_FAILED
+            fi
+        fi
+    fi
+
+    return $?
+}
+
+nasshare_mountftpshares()
+{
+    local exit=0
+    local zpool_list="`zpool list -H -o name 2>/dev/null`"
+    local haresources="`$CFG_FILE ls_val_vars $CLUSTER_CONF resources 2>/dev/null | awk -F "=" '{print $2}' | awk -F ";" '{print $2}' | sed 's/\"//g'`"
+    ls "${FTP_SHARES}" | sort | while read SHARE 
+    do
+        dataset="`echo $SHARE | sed "s/-/\//g"`"
+        poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+        if [ -n "`echo $zpool_list | grep -w "$poolname"`" ] && [ -z "`echo $haresources | grep -w "$poolname"`" ];then
+            nasshare_mountftpshare $dataset
+        fi
+    done
+}
+
+nasshare_umountftpshare()
+{
+    local exit=0
+    local exit=0
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    
+    local SHARE="${poolname}-${sharename}"
+
+    local mode=`${CFG_FILE} get_var ${NAS_SHARES}${SHARE} MODE FTP`
+    if [ "$mode" == "$FTP_MODE_ANONYMOUS" ]; then
+        if [ -n "`${MOUNT} | awk -v shareMountPoint=\"${FTP_ANONYMOUS_PATH}/${SHARE}\" '{if($3==shareMountPoint) print $3;}'`" ]; then
+            ${UMOUNT} "${FTP_ANONYMOUS_PATH}/${SHARE}" &>/dev/null
+            if [ "$?" -ne 0 ]; then
+                exit=$FTP_UMOUNT_FAILED
+                continue
+            fi
+            ${RM} -rf "${FTP_ANONYMOUS_PATH}/${SHARE}"
+        fi
+    elif [ "$mode" == "$FTP_MODE_USER" ]; then
+        if [ -n "`${MOUNT} | awk -v shareMountPoint=\"${FTP_USER_PATH}/${SHARE}\" '{if($3==shareMountPoint) print $3;}'`" ]; then
+            ${UMOUNT} "${FTP_USER_PATH}/${SHARE}" &>/dev/null
+            if [ "$?" -ne 0 ]; then
+                exit=$FTP_UMOUNT_FAILED
+                continue
+            fi
+            ${RM} -rf "${FTP_USER_PATH}/${SHARE}"
+        fi
+    fi
+
+    return $exit
+}
+
+nasshare_umountftpshares()
+{
+    local exit=0
+    local zpool_list="`zpool list -H -o name 2>/dev/null`"
+    local haresources="`$CFG_FILE ls_val_vars $CLUSTER_CONF resources 2>/dev/null | awk -F "=" '{print $2}' | awk -F ";" '{print $2}' | sed 's/\"//g'`"
+    ls "${FTP_SHARES}" | sort | while read SHARE 
+    do
+        dataset="`echo $SHARE | sed "s/-/\//g"`"
+        poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+        if [ -n "`echo $zpool_list | grep -w "$poolname"`" ] && [ -z "`echo $haresources | grep -w "$poolname"`" ];then
+            nasshare_umountftpshare $dataset
+        fi
+    done
+}
+
+nasshare_mkconfsmb()
+{
+    local exit=0
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="${NAS_SHARES}${poolname}-${sharename}"
+    local smbsharefile="${SMB_SHARES}${poolname}-${sharename}"
+    local SHARE="${poolname}-${sharename}"
+
+    SMB_SERVICE_ENABLED="`${CFG_FILE} get_var \"${NAS_SERVICES_SMB}\" SERVICE_ENABLED`"
+
+    SMB_USE="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" SMB`"
+    ACTIVE="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" ACTIVE`"
+    SHARE_PATH="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" PATH`"
+    COMMENT="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" COMMENT`"
+    RO="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" RO \"SMB\"`"
+    VISIBLE="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" VISIBLE \"SMB\"`"
+    ACCESS="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" ACCESS \"SMB\"`"
+    ALLOW_USERS="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" ALLOW_USERS \"SMB\"`"
+    ALLOW_GROUPS="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" ALLOW_GROUPS \"SMB\"`"
+    FORCE_USER_ENABLED="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" FORCE_USER_ENABLED \"SMB\"`"
+    FORCE_USER="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" FORCE_USER \"SMB\"`"
+    FORCE_GROUP_ENABLED="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" FORCE_GROUP_ENABLED \"SMB\"`"
+    FORCE_GROUP="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" FORCE_GROUP \"SMB\"`"
+    ALLOW_IP="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" ALLOW_IP \"SMB\"`"
+    DENY_IP="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" DENY_IP \"SMB\"`"
+
+    LARGE_DIR="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" LARGE_DIR \"SMB\"`"
+    CASE="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" CASE \"SMB\"`"
+
+    if [ "${RO}" != "1" ]; then
+        RO="No"
+    else
+        RO="Yes"
+    fi
+
+    if [ "${VISIBLE}" != "1" ]; then
+        VISIBLE="No"
+    else
+        VISIBLE="Yes"
+    fi
+
+    [ -n "${ALLOW_USERS}" ] && SYS_USR="`nasusers2smbusers \"${ALLOW_USERS}\"`" || unset SYS_USR
+    [ -n "${ALLOW_GROUPS}" ] && SYS_GRP="`nasgroups2smbgroups \"${ALLOW_GROUPS}\"`" || unset SYS_GRP
+    [ -n "${SYS_USR}" -a -n "${SYS_GRP}" ] && SEPARATOR="," || SEPARATOR=""
+    VALID_USERS="${SYS_USR}${SEPARATOR}${SYS_GRP}"
+    if [ "${ACCESS}" != "1" ]; then
+        ACCESS="No"
+        [ -n "${VALID_USERS}" ] || VALID_USERS='*'
+    else
+        ACCESS="Yes"
+        VALID_USERS=""
+    fi
+
+    if [ "${FORCE_USER_ENABLED}" == "1" ]; then
+        FORCE_USER_ENTRY="force user = ${FORCE_USER}"
+    fi
+
+    if [ "${FORCE_GROUP_ENABLED}" == "1" ]; then
+        FORCE_GROUP_ENTRY="force group = ${FORCE_GROUP}"
+    fi
+
+    if [ "$LARGE_DIR" = "1" ]; then
+        CASE_SENSITIVE="yes"
+        if [ $CASE -eq 0 ]; then
+            DEFAULT_CASE="lower"
+        else
+            DEFAULT_CASE="upper"
+        fi
+
+        PRESERVE_CASE="no"
+        SHORT_PRESERVE_CASE="no"
+    else
+        CASE_SENSITIVE="no"
+        DEFAULT_CASE="lower"
+        PRESERVE_CASE="yes"
+        SHORT_PRESERVE_CASE="yes"
+    fi
+    
+    ${CAT} > "${SMB_SHARES}${SHARE}" << EOF
+[${SHARE}]
+    path = ${SHARE_PATH}
+    comment = ${COMMENT}
+    guest ok = ${ACCESS}
+    hosts allow = ${ALLOW_IP}
+    hosts deny = ${DENY_IP}
+    read only = ${RO}
+    browseable = ${VISIBLE}
+    printable = No
+    valid users = ${VALID_USERS}
+    case sensitive = ${CASE_SENSITIVE}
+    default case = ${DEFAULT_CASE}
+    preserve case = ${PRESERVE_CASE}
+    short preserve case = ${SHORT_PRESERVE_CASE}
+    ${FORCE_USER_ENTRY}
+    ${FORCE_GROUP_ENTRY}
+
+EOF
+
+    TMP_FILE="`/bin/mktemp`"
+    ${CAT} "${NAS_PROTOCOLS_SMB_SHARES}" | ${GREP} -v "^include=${SMB_SHARES}${SHARE}\$" > $TMP_FILE
+    ${ECHO} "include=${SMB_SHARES}${SHARE}" >> $TMP_FILE
+    ${MV} "${TMP_FILE}" "${NAS_PROTOCOLS_SMB_SHARES}"
+    ${CHMOD} 666 "${NAS_PROTOCOLS_SMB_SHARES}"
+
+    if [ "$SMB_SERVICE_ENABLED" = "true" ];then
+        $SMB reload
+    fi
+
+    return $exit
+}
+
+nasshare_mkconfsmbs()
+{
+    local exit=0
+
+    ${RM} -fr "${SMB_SHARES}"
+
+    [ -d $SMB_SHARES ] || \
+    { ${MKDIR} $SMB_SHARES && chmod u+rw,g+rw,o+rw $SMB_SHARES ; } || \
+    { ${ECHO} "$SMB_SHARES does not exist" ; return 0 ; }
+
+    [ -s $NAS_PROTOCOLS_SMB_SHARES ] || \
+    { ${TOUCH} $NAS_PROTOCOLS_SMB_SHARES && chmod u+rw,g+rw,o+rw $NAS_PROTOCOLS_SMB_SHARES ; } || \
+    { ${ECHO} "$NAS_PROTOCOLS_SMB_SHARES does not exist" ; return 0 ; }
+
+    > $NAS_PROTOCOLS_SMB_SHARES
+
+    SMB_SERVICE_ENABLED="`${CFG_FILE} get_var \"${NAS_SERVICES_SMB}\" SERVICE_ENABLED`"
+
+    if [ $exit = 0 ]; then
+        ls "${NAS_SHARES}" | sort |
+        while read SHARE; do
+            dataset="`echo $SHARE | sed "s/-/\//g"`"
+            nasshare_mkconfsmb $dataset
+        done;
+    fi
+
+    return $exit
+}
+
+nasshare_mkconfnfs()
+{
+    local exit=0
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="${NAS_SHARES}${poolname}-${sharename}"
+    local SHARE="${poolname}-${sharename}"
+
+    if [ ! -f "$nassharefile" ]; then
+        return 1
+    fi
+
+    NFS_SERVICE_ENABLED="`${CFG_FILE} get_var \"${NAS_SERVICES_NFS}\" SERVICE_ENABLED`"
+
+    NFS_USE="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" NFS`"
+    ACTIVE="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" ACTIVE`"
+    INSECURE="`$CFG_FILE get_var \"${NAS_SHARES}${SHARE}\" INSECURE NFS`"
+    SYNCHRONOUS="`$CFG_FILE get_var \"${NAS_SHARES}${SHARE}\" SYNCHRONOUS NFS`"
+    INSECURE_LOCKS="`$CFG_FILE get_var \"${NAS_SHARES}${SHARE}\" INSECURE_LOCKS NFS`"
+    ALL_SQUASH="`$CFG_FILE get_var \"${NAS_SHARES}${SHARE}\" ALL_SQUASH NFS`"
+    NO_ROOT_SQUASH="`$CFG_FILE get_var \"${NAS_SHARES}${SHARE}\" NO_ROOT_SQUASH NFS`"
+    ACCESS_IP="`$CFG_FILE get_var \"${NAS_SHARES}${SHARE}\" ACCESS_IP NFS`"
+    WRITE_IP="`$CFG_FILE get_var \"${NAS_SHARES}${SHARE}\" WRITE_IP NFS`"
+    SHARE_PATH="`$CFG_FILE get_var \"${NAS_SHARES}${SHARE}\" PATH`"
+    ANONUID="`$CFG_FILE get_var \"${NAS_SHARES}${SHARE}\" ANONUID NFS`"
+    ANONGID="`$CFG_FILE get_var \"${NAS_SHARES}${SHARE}\" ANONGID NFS`"
+
+    ALIAS_PATH="${SHARE}"
+    STC=",no_subtree_check";
+
+    [ "$NO_ROOT_SQUASH" == 1 ] && RSQ=",no_root_squash";
+    [ "$ALL_SQUASH" == 1 ] && ASQ=",all_squash";
+    [ "$INSECURE" == 1 ] && SEC=",insecure";
+    [ "$INSECURE_LOCKS" == 1 ] && SEC2=",insecure_locks";
+    [ "$SYNCHRONOUS" == 1 ] && SYC=",sync" || SYC=",async";
+    [ "$ACCESS_IP" ] && IP="$ACCESS_IP" || IP="";
+    [ "$WRITE_IP" ] && WRITE_IP="$WRITE_IP";
+    #ALIAS=",path_alias=\"/${SHARE}\""
+
+    [ "$ANONUID" ] && USQ=",anonuid=$ANONUID" || USQ="";
+    [ "$ANONGID" ] && GSQ=",anongid=$ANONGID" || GSQ="";
+    
+    TOFILE="\"${SHARE_PATH}\"\t"
+
+    if [ \( "$IP" == "none_ip" -o "$IP" == "" \) -a \( "$WRITE_IP" != "none_ip" -a     "$WRITE_IP" != "" \) ] ;then
+            ACC="ro"
+            TOFILE="$TOFILE *($ACC$STC$RSQ$ASQ$SEC$SEC2$SYC"$ALIAS"$USQ$GSQ) "
+    fi
+
+    if [ \( "$IP" == "none_ip" -o "$IP" == "" \) -a \( "$WRITE_IP" == "none_ip" -o     "$WRITE_IP" == "" \) ] ;then
+        ACC="rw"
+        TOFILE="$TOFILE *($ACC$STC$RSQ$ASQ$SEC$SEC2$SYC"$ALIAS"$USQ$GSQ) "
+    else
+        IP=$(`echo -e $IP|tr "," " "`)
+        WRITE_IP=$(`echo -e $WRITE_IP|tr "," " "`)
+        I=0
+        while [ $I -lt ${#IP} ]
+        do
+            unset ALSO_WRITE
+            ACC="ro"
+
+            for (( J=0 ; J<${#WRITE_IP[@]} ; J++ )); do
+                if [ "${IP[$I]}" == "${WRITE_IP[$J]}" ];then
+                    ALSO_WRITE="YES";
+                    break;
+                fi
+            done
+
+            if [ "$ALSO_WRITE" != "YES" -a "${IP[$I]}" != "none_ip" ] ;then
+                TOFILE="$TOFILE${IP[$I]}($ACC$STC$RSQ$ASQ$SEC$SEC2$SYC"$ALIAS"$USQ$GSQ) "
+            fi
+
+            I=$[I+1]
+        done
+
+        I=0
+        while [ $I -lt ${#WRITE_IP[@]} ]; do
+            ACC="rw"
+            if [ "${WRITE_IP[$I]}" != "none_ip" ] ;then
+                TOFILE="$TOFILE${WRITE_IP[$I]}($ACC$STC$RSQ$ASQ$SEC$SEC2$SYC"$ALIAS"$USQ$GSQ) "
+            fi
+
+            I=$[I+1]
+        done
+    fi
+
+    if [ "$NFS_USE" = "1" ]; then
+        #${GREP} -vE "^${NAS_MNT_PNT}    *(ro,no_subtree_check,no_root_squash,all_squash,insecure,sync)" "$NAS_PROTOCOLS_NFS_EXPORTS" > /tmp/exports_tmp0
+        ${GREP} -vE "^\"${SHARE_PATH}\"" "$NAS_PROTOCOLS_NFS_EXPORTS" > /tmp/exports_tmp0
+        ${MV} /tmp/exports_tmp0 "$NAS_PROTOCOLS_NFS_EXPORTS"
+        ${ECHO} -e "$TOFILE" >> "$NAS_PROTOCOLS_NFS_EXPORTS"
+    fi
+
+    if [ "$NFS_SERVICE_ENABLED" = "true" ]; then
+        ${EXPORTFS} -r >/dev/null 2>&1
+    fi
+
+    return $exit
+}
+
+nasshare_mkconfnfses()
+{
+    local exit=0
+
+    [ -s $NAS_PROTOCOLS_NFS_EXPORTS ] || \
+    { ${TOUCH}touch $NAS_PROTOCOLS_NFS_EXPORTS && chmod u+rw,g+rw,o+rw $NAS_PROTOCOLS_NFS_EXPORTS ; } || \
+    { ${ECHO} "$NAS_PROTOCOLS_NFS_EXPORTS does not exist" ; return 0 ; }
+
+    > $NAS_PROTOCOLS_NFS_EXPORTS
+
+    NFS_SERVICE_ENABLED="`${CFG_FILE} get_var \"${NAS_SERVICES_NFS}\" SERVICE_ENABLED`"
+
+    if [ $exit = 0 ]; then
+        ls "${NAS_SHARES}" | sort |
+        while read SHARE; do
+            dataset="`echo $SHARE | sed "s/-/\//g"`"
+            nasshare_mkconfnfs $dataset
+        done;
+    fi
+}
+
+nasshare_mkconfftp()
+{
+    local exit=0
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local SHARE="${poolname}-${sharename}"
+
+    FTP_SERVICE_ENABLED="`${CFG_FILE} get_var \"${NAS_SERVICES_FTP}\" SERVICE_ENABLED`"
+
+    local tmpFile=`mktemp`
+    local ftpsharefile="${FTP_SHARES}${SHARE}"
+    FTP_USE="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" FTP`"
+    RO="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" RO FTP`"
+    MODE="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" MODE FTP`"
+    ALLOW_USERS="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" ALLOW_USERS FTP`"
+    ALLOW_GROUPS="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" ALLOW_GROUPS FTP`"
+    ACCESS_IP="`$CFG_FILE get_var \"${NAS_SHARES}${SHARE}\" ACCESS_IP FTP`"
+    WRITE_IP="`$CFG_FILE get_var \"${NAS_SHARES}${SHARE}\" WRITE_IP FTP`"
+
+    if [ "$MODE" == "$FTP_MODE_ANONYMOUS" ]; then
+        echo -e "<Directory ${FTP_ANONYMOUS_PATH}/${SHARE}>\n<Limit DIRS LIST READ PORT PASSIVE PASV>\n Order Allow,Deny\n" > $tmpFile
+        if [ -z "$ACCESS_IP" ]; then
+            echo -e " AllowAll\n</Limit>" >> $tmpFile
+        else
+            echo -e " Allow $ACCESS_IP\n DenyAll\n</Limit>" >> $tmpFile
+        fi
+        if [ "$RO" -eq 1 ]; then
+            echo -e "<Limit WRITE RMD>\n DenyAll\n</Limit>\n</Directory>" >> $tmpFile
+        else
+            if [ -z "$WRITE_IP" ]; then
+                echo -e "<Limit WRITE RMD>\n Order Allow,Deny\n AllowAll\n</Limit>" >>$tmpFile
+            else
+                echo -e "<Limit WRITE RMD>\n Order Allow,Deny\n Allow $WRITE_IP\n DenyAll\n</Limit>" >>$tmpFile
+            fi
+            echo -e "</Directory>" >> $tmpFile
+        fi
+        
+        mv $tmpFile $ftpsharefile
+        local line="include "\""$ftpsharefile"\"
+        ${GREP} -v "^$line$" ${NAS_PROTOCOLS_FTP_USER_SHARES} 2>/dev/null > $tmpFile
+        mv $tmpFile ${NAS_PROTOCOLS_FTP_USER_SHARES}
+        chmod 666 ${NAS_PROTOCOLS_FTP_USER_SHARES}
+        ${GREP} -v "^$line$" ${NAS_PROTOCOLS_FTP_ANONY_SHARES} 2>/dev/null > $tmpFile
+        echo "include "\""$ftpsharefile"\" >> $tmpFile
+        mv $tmpFile ${NAS_PROTOCOLS_FTP_ANONY_SHARES}
+        chmod 666 ${NAS_PROTOCOLS_FTP_ANONY_SHARES}
+
+    elif [ "$MODE" == "$FTP_MODE_USER" ];then
+        echo -e "<Directory ${FTP_USER_PATH}/${SHARE}>\n<Limit DIRS LIST READ WRITE PORT PASSIVE PASV>\n Order Allow,Deny\n" > $tmpFile
+        echo "$ALLOW_USERS" | awk -F "," '{for(i=1;i<=NF;i++) print $i;}' | while read USER
+        do
+            echo " AllowUser \"""$USER""\"" >> $tmpFile
+        done
+        echo "$ALLOW_GROUPS" | awk -F "," '{for(i=1;i<=NF;i++) print $i;}' | while read GROUP
+        do
+            echo " AllowGroup \"""$GROUP""\"" >> $tmpFile
+        done
+        echo -e " IgnoreHidden off\n DenyAll\n</Limit>" >> $tmpFile
+        if [ "$RO" -eq 1 ]; then
+            echo -e "<Limit WRITE RMD>\n DenyAll\n</Limit>\n</Directory>" >> $tmpFile
+        else
+            echo -e "</Directory>" >> $tmpFile
+        fi
+
+        mv $tmpFile $ftpsharefile
+        local line="include "\""$ftpsharefile"\"
+        ${GREP} -v "^$line$" ${NAS_PROTOCOLS_FTP_USER_SHARES} 2>/dev/null > $tmpFile
+        echo "include "\""$ftpsharefile"\" >> $tmpFile
+        mv $tmpFile ${NAS_PROTOCOLS_FTP_USER_SHARES}
+        chmod 666 ${NAS_PROTOCOLS_FTP_USER_SHARES}
+        ${GREP} -v "^$line$" ${NAS_PROTOCOLS_FTP_ANONY_SHARES} 2>/dev/null > $tmpFile
+        mv $tmpFile ${NAS_PROTOCOLS_FTP_ANONY_SHARES}
+        chmod 666 ${NAS_PROTOCOLS_FTP_ANONY_SHARES}
+
+    fi
+
+    if [ "$FTP_SERVICE_ENABLED" = "true" ];then
+        $FTP reload
+    fi
+
+    return $exit
+}
+
+nasshare_mkconfrsync()
+{
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="${NAS_SHARES}${poolname}-${sharename}"
+    local SHARE="${poolname}-${sharename}"
+    local RSYNC_CONF_TMP="`mktemp`"
+    local RSYNC_ENABLED="`${CFG_FILE} get_var ${nassharefile} RSYNC`"
+    local ACTIVE="`${CFG_FILE} get_var ${nassharefile} ACTIVE`"
+    local SHARE_PATH="`${CFG_FILE} get_var ${nassharefile} PATH`"
+
+    cat "$RSYNC_CONF" | grep "\[${SHARE}\]" &>/dev/null
+    if [ $? -eq 0 ];then
+        #cat "$RSYNC_CONF" | awk -v share="\[${SHARE}\]" '{do { if ($0 ~ share) {dont_disp=1} else if ($0 ~ "\[*\]") {dont_disp=0} if (dont_disp!=1) {print $0} } while (getline)}' > "$RSYNC_CONF_TMP"
+        ${CFG_FILE} del_section "$RSYNC_CONF" "$SHARE"
+        cp "$RSYNC_CONF" "$RSYNC_CONF_TMP"
+    else
+        cp "$RSYNC_CONF" "$RSYNC_CONF_TMP"
+    fi
+
+    if [ "$RSYNC_ENABLED" == "1" -a -d "$SHARE_PATH" -a "$ACTIVE" != "0" ]; then
+        #RSYNC_LOGIN="`${CFG_FILE} get_var ${nassharefile} LOGIN RSYNC`"
+        #RSYNC_PASSWORD="`${CFG_FILE} get_var ${nassharefile} PASSWORD RSYNC`"
+        RSYNC_USERS="`${CFG_FILE} get_var ${nassharefile} ALLOW_USERS RSYNC`"
+        RSYNC_ANONYMOU="`${CFG_FILE} get_var ${nassharefile} ANONYMOU RSYNC`"
+        RSYNC_IP="`${CFG_FILE} get_var ${nassharefile} ACCESS_IP RSYNC`"
+        RSYNC_RO="`${CFG_FILE} get_var ${nassharefile} RO RSYNC`"
+        LIST="`${CFG_FILE} get_var ${nassharefile} LIST RSYNC`"
+
+        echo "[${SHARE}]" >> "$RSYNC_CONF_TMP"
+        echo "path = $SHARE_PATH" >> "$RSYNC_CONF_TMP"
+        #echo "read only = no" >> "$RSYNC_CONF_TMP"
+        echo "use chroot = yes" >> "$RSYNC_CONF_TMP"
+        echo "secrets file = ${RSYNC_SECRETS}secrets.${SHARE}" >> "$RSYNC_CONF_TMP"
+        echo -e "${RSYNC_USERS}\n" > "${RSYNC_SECRETS}secrets.${SHARE}"
+
+#       if [ -n "$RSYNC_LOGIN" ];then
+#           #echo -e "${RSYNC_LOGIN}:${RSYNC_PASSWORD}\n" > "${RSYNC_SECRETS}secrets.${SHARE}"
+#           echo -e "${RSYNC_LOGIN}\n" > "${RSYNC_SECRETS}secrets.${SHARE}"
+#           echo "secrets file = ${RSYNC_SECRETS}secrets.${SHARE}" >> "$RSYNC_CONF_TMP"
+#           echo "auth users = ${RSYNC_LOGIN}" >> "$RSYNC_CONF_TMP"
+#       fi
+
+        if [ "$RSYNC_ANONYMOU" == "1" ]; then
+            echo "auth users = " >> "$RSYNC_CONF_TMP"
+        elif [ -z "${RSYNC_USERS}" ]; then
+            echo "auth users = **no*auth*user**" >>"$RSYNC_CONF_TMP"
+        else
+            echo "auth users = ${RSYNC_USERS}" >> "$RSYNC_CONF_TMP"
+        fi
+
+        if [ -n "$RSYNC_IP" ];then
+            echo "hosts allow = $RSYNC_IP" >> "$RSYNC_CONF_TMP"
+        else
+            echo "hosts allow = " >> "$RSYNC_CONF_TMP"
+        fi
+
+        if [ "$RSYNC_RO" == "1" ]; then
+            echo "read only = yes" >> "$RSYNC_CONF_TMP"
+        else
+            echo "read only = no" >> "$RSYNC_CONF_TMP"
+        fi
+
+        if [ "$LIST" == "1"  ]; then
+            echo "list = yes" >> "$RSYNC_CONF_TMP"
+        else
+            echo "list = no" >> "$RSYNC_CONF_TMP"
+        fi
+
+        echo >> "$RSYNC_CONF_TMP"
+        mv -f "$RSYNC_CONF_TMP" "$RSYNC_CONF"
+    else
+        ${CFG_FILE} del_section "$RSYNC_CONF" "$SHARE"
+    fi
+
+    rm -f "$RSYNC_CONF_TMP"
+    chmod 644 "$RSYNC_CONF"
+}
+
+nasshare_mkconfhttp()
+{
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local SHARE="${poolname}-${sharename}"
+
+    if [ ! -d /RAMDISK/http_shares/ ]; then
+        mkdir -p /RAMDISK/http_shares/
+    fi
+    
+    IS_ACCESS="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" HTTP_ACCESS HTTP`"
+    IS_ACTIVE="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" ACTIVE`"
+    if [ "$IS_ACCESS" == "1" -a "$IS_ACTIVE" != "0" ]; then
+        SET_ACCESS="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" PATH`"
+        [ -h "/RAMDISK/http_shares/$SHARE" ] && rm -f "/RAMDISK/http_shares/$SHARE"
+        ln -s "$SET_ACCESS" "/RAMDISK/http_shares/$SHARE"
+    else
+        rm -f "/RAMDISK/http_shares/$SHARE"
+    fi
+}
+
+nasshare_rmconfsmb()
+{
+    local exit=0
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="${NAS_SHARES}${poolname}-${sharename}"
+    local smbsharefile="${SMB_SHARES}${poolname}-${sharename}"
+    local SHARE="${poolname}-${sharename}"
+
+    SMB_SERVICE_ENABLED="`${CFG_FILE} get_var \"${NAS_SERVICES_SMB}\" SERVICE_ENABLED`"
+
+    SMB_USE="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" SMB`"
+    ACTIVE="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" ACTIVE`"
+    SHARE_PATH="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" PATH`"
+    
+    ${RM} -f "${SMB_SHARES}${SHARE}"
+    if [ "$SMB_SERVICE_ENABLED" = "true" ]; then
+        if [ "$SMB_USE" = "1" ]; then
+            local smbdpids="`pidof smbd`"
+            ${SMBCONTROL} smbd close-share "${SHARE}" >/dev/null 2>&1
+            for smbdpid in $smbdpids; do
+                ${SMBCONTROL} $smbdpid close-share "${SHARE}" >/dev/null 2>&1
+            done
+            for smbpid in `net status shares parseable | grep "${SHARE}" | awk -F '\' '{print $2}'`
+            do
+                kill -9 $smbpid
+            done
+        fi
+    fi
+
+    TMP_FILE="`/bin/mktemp`"
+    ${CAT} "${NAS_PROTOCOLS_SMB_SHARES}" | ${GREP} -v "^include=${SMB_SHARES}${SHARE}\$" > $TMP_FILE
+    ${MV} "${TMP_FILE}" "${NAS_PROTOCOLS_SMB_SHARES}"
+    ${CHMOD} 666 "${NAS_PROTOCOLS_SMB_SHARES}"
+
+    if [ "$SMB_SERVICE_ENABLED" = "true" ];then
+        $SMB reload
+    fi
+
+    return $exit
+}
+
+nasshare_rmconfsmbs()
+{
+    local exit=0
+
+    ${RM} -fr "${SMB_SHARES}"
+
+    [ -d $SMB_SHARES ] || \
+    { ${MKDIR} $SMB_SHARES && chmod u+rw,g+rw,o+rw $SMB_SHARES ; } || \
+    { ${ECHO} "$SMB_SHARES does not exist" ; return 0 ; }
+
+    [ -f $NAS_PROTOCOLS_SMB_SHARES ] || \
+    { ${TOUCH} $NAS_PROTOCOLS_SMB_SHARES && chmod u+rw,g+rw,o+rw $NAS_PROTOCOLS_SMB_SHARES ; }
+
+    > $NAS_PROTOCOLS_SMB_SHARES
+    exit=$?
+
+    return $exit
+}
+
+nasshare_rmconfnfs()
+{
+    local exit=0
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="${NAS_SHARES}${poolname}-${sharename}"
+    local SHARE="${poolname}-${sharename}"
+
+    if [ ! -f "$nassharefile" ]; then
+        return 1
+    fi
+
+    NFS_SERVICE_ENABLED="`${CFG_FILE} get_var \"${NAS_SERVICES_NFS}\" SERVICE_ENABLED`"
+
+    NFS_USE="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" NFS`"
+    ACTIVE="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" ACTIVE`"
+    SHARE_PATH="`$CFG_FILE get_var \"${NAS_SHARES}${SHARE}\" PATH`"
+
+    if [ "$NFS_SERVICE_ENABLED" = "true" ]; then
+        if [ "$NFS_USE" = "1" ]; then
+            ${EXPORTFS} -u "*:${SHARE_PATH}"
+        fi
+    fi
+
+    #${GREP} -vE "^${NAS_MNT_PNT}    *(ro,no_subtree_check,no_root_squash,all_squash,insecure,sync)" "$NAS_PROTOCOLS_NFS_EXPORTS" > /tmp/exports_tmp0
+    ${GREP} -vE "^\"${SHARE_PATH}\"" "$NAS_PROTOCOLS_NFS_EXPORTS" > /tmp/exports_tmp0
+    ${MV} /tmp/exports_tmp0 "$NAS_PROTOCOLS_NFS_EXPORTS"
+
+    if [ "$NFS_SERVICE_ENABLED" = "true" ]; then
+        ${EXPORTFS} -r >/dev/null 2>&1
+    fi
+
+    return $exit
+}
+
+nasshare_rmconfnfses()
+{
+    local exit=0
+
+    [ -f $NAS_PROTOCOLS_NFS_EXPORTS ] || \
+    { ${TOUCH} $NAS_PROTOCOLS_NFS_EXPORTS && chmod u+rw,g+rw,o+rw $NAS_PROTOCOLS_NFS_EXPORTS ; }
+
+    > $NAS_PROTOCOLS_NFS_EXPORTS
+    exit=$?
+
+    return $exit
+}
+
+nasshare_rmconfftp()
+{
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="${NAS_SHARES}${poolname}-${sharename}"
+    local SHARE="${poolname}-${sharename}"
+
+    if [ -n "$dataset" ]; then
+        FTP_SERVICE_ENABLED="`${CFG_FILE} get_var \"${NAS_SERVICES_FTP}\" SERVICE_ENABLED`"
+        
+        FTP_USE="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" FTP`"
+        ${RM} -f "${FTP_SHARES}${SHARE}"
+
+        TMP_FILE="`/bin/mktemp`"
+        ${GREP} -v "^include \"${FTP_SHARES}${SHARE}\"$" ${NAS_PROTOCOLS_FTP_ANONY_SHARES} 2>/dev/null > $TMP_FILE
+        ${MV} "${TMP_FILE}" "${NAS_PROTOCOLS_FTP_ANONY_SHARES}"
+        ${GREP} -v "^include \"${FTP_SHARES}${SHARE}\"$" ${NAS_PROTOCOLS_FTP_USER_SHARES} 2>/dev/null > $TMP_FILE
+        ${MV} "${TMP_FILE}" "${NAS_PROTOCOLS_FTP_USER_SHARES}"
+        ${CHMOD} 666 "${NAS_PROTOCOLS_FTP_ANONY_SHARES}" "${NAS_PROTOCOLS_FTP_USER_SHARES}"
+        
+        if [ "$FTP_SERVICE_ENABLED" = "true" ];then
+            $FTP restart
+        fi
+    else
+        ${RM} -fr "${FTP_SHARES}"
+        
+        if [ ! -d "$FTP_SHARES" ]; then
+            ${MKDIR} $FTP_SHARES
+            chmod 666 $FTP_SHARES
+        fi
+
+        > $NAS_PROTOCOLS_FTP_ANONY_SHARES
+        > $NAS_PROTOCOLS_FTP_USER_SHARES
+    fi
+
+    return $?
+}
+
+
+nasshare_rmconfrsync()
+{
+    local exit=0
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local sharefile="${NAS_SHARES}${poolname}-${sharename}"
+    local SHARE="${poolname}-${sharename}"
+
+    if [ ! -f "$sharefile" ]; then
+        return 1
+    fi
+
+    RSYNC_SERVICE_ENABLED="`${CFG_FILE} get_var \"${NAS_SERVICES_RSYNC}\" SERVICE_ENABLED`"
+    if [ $exit = 0 ]; then
+        RSYNC_USE="`${CFG_FILE} get_var \"${NAS_SHARES}${SHARE}\" RSYNC`"
+        ls "${NAS_SHARES}" | ${GREP} -w ${SHARE} | sort |
+        while read SHARE; do
+            ${CFG_FILE} del_section "$RSYNC_CONF" "$SHARE"
+        done;
+    fi
+
+    return $?
+}
+
+nasshare_rmconfhttp()
+{
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local SHARE="${poolname}-${sharename}"
+    rm -f "/RAMDISK/http_shares/$SHARE"
+    return $?
+}
+
+# --- public routine section ---------------------------------------------
+
+nasshare_list()
+{
+    local verbose="$1"
+    local path="$NAS_SHARES"
+    local sharedataset
+    local sharepath
+    local sharestate
+    local sharecomment
+    local sharesmbenabled
+    local sharenfsenabled
+    if [ "$verbose" = "-v" ];then
+        #mountstatus="`${MOUNT} | grep "type zfs"`"
+        smbconnectstatus="`net status shares parseable`"
+        nfsconnectstatus="`showmount --all 2>/dev/null`"
+        ftpconnectstatus="`ftpwho -v 2>/dev/null`"
+        
+        for SHARE in `ls -1 "$path" | sort`;do
+            sharedataset=`awk -F "=" '{if($1=="DATASET") print $2;}' "$NAS_SHARES""$SHARE" 2>/dev/null`
+            sharepath=`awk -F "=" '{if($1=="PATH") print $2;}' "$NAS_SHARES""$SHARE" 2>/dev/null`
+            
+            if [ -n "`zfs list 2>/dev/null | grep "^$sharedataset "`" ];then
+                local poolname="`echo $sharedataset | awk -F "/" '{print $1}'`"
+                if [ "`zpool status $poolname 2>/dev/null | grep -E "state: ONLINE|state: DEGRADED"`" ];then
+                    sharestate="active"
+                else
+                    sharestate="unavailable"
+                fi
+            else
+                sharestate="inactive"
+            fi
+            
+            sharecomment=`awk -F "=" '{if($1=="COMMENT") print $2;}' "$NAS_SHARES""$SHARE" 2>/dev/null`
+            sharesmbenabled=`awk -F "=" '{if($1=="SMB") print $2;}' "$NAS_SHARES""$SHARE" 2>/dev/null`
+            sharenfsenabled=`awk -F "=" '{if($1=="NFS") print $2;}' "$NAS_SHARES""$SHARE" 2>/dev/null`
+            shareftpenabled=`awk -F "=" '{if($1=="FTP") print $2;}' "$NAS_SHARES""$SHARE" 2>/dev/null`
+            sharersyncenabled=`awk -F "=" '{if($1=="RSYNC") print $2;}' "$NAS_SHARES""$SHARE" 2>/dev/null`
+            sharehttpenabled=`awk -F "=" '{if($1=="HTTP") print $2;}' "$NAS_SHARES""$SHARE" 2>/dev/null`
+            sharesmbconnectcnt=`echo "$smbconnectstatus" | grep -w "^$SHARE" | wc -l`
+            snarenfsconnectcnt=`echo "$nfsconnectstatus" | grep -w "$SHARE$" | wc -l`
+            snareftpconnectcnt=`echo "$ftpconnectstatus" | grep -w "location:" | grep -w "$SHARE$" | wc -l`
+
+            echo "share_name=${sharedataset}|share_dataset=${sharedataset}|share_path=${sharepath}|share_state=${sharestate}|share_comment=${sharecomment}\
+|share_smb_enabled=${sharesmbenabled}|share_nfs_enabled=${sharenfsenabled}|share_ftp_enabled=${shareftpenabled}|share_rsync_enabled=${sharersyncenabled}|share_http_enabled=${sharehttpenabled}\
+|share_smb_connectcnt=$sharesmbconnectcnt|share_nfs_connectcnt=$snarenfsconnectcnt|share_ftp_connectcnt=$snareftpconnectcnt"
+        done;
+        rm -f $tmpLvStatus $tmpLvInfo
+    else
+        for SHARE in `ls -1 "$path" | sort`;do
+            sharedataset=`awk -F "=" '{if($1=="DATASET") print $2;}' "$NAS_SHARES""$SHARE" 2>/dev/null`
+            echo $sharedataset
+        done | sort
+    fi
+    return $?
+}
+
+nasshare_info()
+{
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local sharefile="$NAS_SHARES${poolname}-${sharename}"
+    local sharedataset
+    local sharepath
+    local sharestate
+    local sharecomment
+    local sharesmbenabled
+    local sharenfsenabled
+
+    if [ ! -f "$sharefile" ]; then
+        return 1
+    fi
+    
+    sharedataset="`$CFG_FILE get_var \"$sharefile\" DATASET`"
+    sharepath="`$CFG_FILE get_var \"$sharefile\" PATH`"
+
+    if [ -n "`zfs list 2>/dev/null | grep "^$sharedataset "`" ];then
+        local poolname="`echo $sharedataset | awk -F "/" '{print $1}'`"
+        if [ "`zpool status $poolname 2>/dev/null | grep -E "state: ONLINE|state: DEGRADED"`" ];then
+            sharestate="active"
+        else
+            sharestate="unavailable"
+        fi
+    else
+        sharestate="inactive"
+    fi
+    
+    sharecomment="`$CFG_FILE get_var \"$sharefile\" COMMENT | sed 's/\"//g'`"
+    sharesmbenabled="`$CFG_FILE get_var \"$sharefile\" SMB`"
+    sharenfsenabled="`$CFG_FILE get_var \"$sharefile\" NFS`"
+    shareftpenabled="`$CFG_FILE get_var \"$sharefile\" FTP`"
+    sharersyncenabled="`$CFG_FILE get_var \"$sharefile\" RSYNC`"
+    sharehttpenabled="`$CFG_FILE get_var \"$sharefile\" HTTP`"
+
+    echo "share_name=${sharedataset}"
+    echo "share_dataset=${sharedataset}"
+    echo "share_path=${sharepath}"
+    echo "share_state=${sharestate}"
+    echo "share_comment=${sharecomment}"
+    echo "share_smb_enabled=${sharesmbenabled}"
+    echo "share_nfs_enabled=${sharenfsenabled}"
+    echo "share_ftp_enabled=${shareftpenabled}"
+    echo "share_rsync_enabled=${sharersyncenabled}"
+    echo "share_http_enabled=${sharehttpenabled}"
+
+    return $?
+}
+
+nasshare_create()
+{
+    local exit=0
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="$NAS_SHARES${poolname}-${sharename}"
+
+    if [ $exit -eq 0 ]; then
+        if ! nasshare_checknassharesexceed ; then
+            return $NAS_SHARE_MAXIMUM
+        fi
+    fi
+    
+    if [ "`nasshare_checkexist \"$sharename\" \"$poolname\"`" -eq 1 ]; then
+        return $NAS_SHARE_EXIST
+    fi
+
+    if [ $exit -eq 0 ]; then
+        nasshare_mknasconf ${sharename} ${poolname}
+        exit=$?
+    fi
+
+    if [ $exit -ne 0 ]; then
+        nasshare_rmnasconf ${sharename} ${poolname}
+    fi
+
+    if [ $exit -eq 0 ]; then
+        local sharesmbenabled="`$CFG_FILE get_var \"$nassharefile\" SMB`"
+        local sharenfsenabled="`$CFG_FILE get_var \"$nassharefile\" NFS`"
+        if [ "$sharesmbenabled" = "1" ]; then
+            nasshare_mkconf ${dataset} smb 2>/dev/null
+        fi
+        if [ "$sharenfsenabled" = "1" ]; then
+            nasshare_mkconf ${dataset} nfs 2>/dev/null
+        fi
+        
+        SHARE_PATH="`${CFG_FILE} get_var \"$nassharefile\" PATH`"
+        permissions="0777"
+        local PERMISSIONSMANAGED="no"
+        local method=`$CFG_FILE get_var $AUTH_CONF_FILE "AUTH_METHOD"`
+        if [ "$method" = "ADS" ];then
+            PERMISSIONSMANAGED=`$CFG_FILE get_var "${AUTH_CONF_PATH}/$method.conf" PERMISSIONSMANAGED`
+            if [ "$PERMISSIONSMANAGED" = "yes" ];then
+                permissions="0755"
+            fi
+        fi
+        chmod $permissions ${SHARE_PATH}
+        
+        if [ "$PERMISSIONSMANAGED" = "yes" ];then
+            ADMIN_UIDNUM="1000500"
+            ADMIN_VALUE="rwx"
+            setfacl -m d:u:$ADMIN_UIDNUM:$ADMIN_VALUE "$SHARE_PATH"
+            setfacl -m u:$ADMIN_UIDNUM:$ADMIN_VALUE "$SHARE_PATH"
+        fi
+
+        $NSH_EVENT logevent "NASSHARE_CREATE" "php" "$sharename"
+    fi
+
+    nsync
+
+    return $exit
+}
+
+nasshare_cnt()
+{
+    local exit=0
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="$NAS_SHARES${poolname}-${sharename}"
+    local SHARE="${poolname}-${sharename}"
+    
+    smbconnectstatus="`net status shares parseable`"
+    nfsconnectstatus="`showmount --all 2>/dev/null`"
+    ftpconnectstatus="`ftpwho -v 2>/dev/null`"
+    
+    sharesmbconnectcnt=`echo "$smbconnectstatus" | grep -w "^$SHARE" | wc -l`
+    snarenfsconnectcnt=`echo "$nfsconnectstatus" | grep -w "$dataset" | wc -l`
+    snareftpconnectcnt=`echo "$ftpconnectstatus" | grep -w "location:" | grep -w "$SHARE" | wc -l`
+    #echo "share_smb_connectcnt=$sharesmbconnectcnt|share_nfs_connectcnt=$snarenfsconnectcnt|share_ftp_connectcnt=$snareftpconnectcnt"
+    ((snarenfsconnectcnt+=snareftpconnectcnt))
+    #echo $snarenfsconnectcnt
+    ((sharesmbconnectcnt+=snarenfsconnectcnt))
+    #echo $sharesmbconnectcnt
+    return $sharesmbconnectcnt
+}
+
+nasshare_ftpcnt()
+{
+    local exit=0
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="$NAS_SHARES${poolname}-${sharename}"
+    local SHARE="${poolname}-${sharename}"
+    
+    ftpconnectstatus="`ftpwho -v 2>/dev/null`"
+    
+    snareftpconnectcnt=`echo "$ftpconnectstatus" | grep -w "location:" | grep -w "$SHARE" | wc -l`
+    return $snareftpconnectcnt
+}
+
+nasshare_delete()
+{
+    local exit=0
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="$NAS_SHARES${poolname}-${sharename}"
+    
+    local sharesmbenabled="`$CFG_FILE get_var \"$nassharefile\" SMB`"
+    local sharenfsenabled="`$CFG_FILE get_var \"$nassharefile\" NFS`"
+    local shareftpenabled="`$CFG_FILE get_var \"$nassharefile\" FTP`"
+    local sharehttpenabled="`$CFG_FILE get_var \"$nassharefile\" HTTP`"
+    local sharersyncenabled="`$CFG_FILE get_var \"$nassharefile\" RSYNC`"
+    
+    
+    if [ "$sharesmbenabled" = "1" ]; then
+        nasshare_rmconf ${dataset} smb 2>/dev/null
+    fi
+    
+    if [ "$sharenfsenabled" = "1" ]; then
+        nasshare_rmconf ${dataset} nfs 2>/dev/null
+    fi
+    
+    if [ "$shareftpenabled" = "1" ]; then
+        nasshare_umountftpshare ${dataset} 2>/dev/null
+        if [ $? -eq 0 ];then
+            nasshare_rmconf ${dataset} ftp 2>/dev/null
+        fi
+    fi
+    
+    if [ "$sharersyncenabled" = "1" ]; then
+        nasshare_rmconf ${dataset} rsync 2>/dev/null
+    fi
+    
+    if [ "$sharehttpenabled" = "1" ];then
+        nasshare_rmconf ${dataset} http 2>/dev/null
+    fi
+    
+    nasshare_rmnasconf ${sharename} ${poolname}
+    exit=$?
+    if [ $exit -eq 0 ]; then
+        $NSH_EVENT logevent "NASSHARE_DELETE" "php" "$sharename"
+    fi
+    
+    nsync
+    return $exit
+}
+
+nasshare_mkconf()
+{
+    local dataset=$1
+    local protocolsname=$2
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="$NAS_SHARES${poolname}-${sharename}"
+    local nassharepath="$VOL_MNT_PT/$poolname/$sharename"
+    local ret=0
+
+    if [ ! -f ${nassharefile} ]; then
+        return 1
+    fi
+    
+    if [ ! -d "$nassharepath" ];then
+        return 0
+    fi
+    
+    if [ -z "$protocolsname" ];then
+        protocolsname="smb nfs ftp rsync http"
+    else
+        protocolsname="`echo $protocolsname | sed "s/,/ /g"`"
+    fi
+    
+    for protocolname in $protocolsname
+    do
+        case "$protocolname" in
+            smb)
+                nasshare_mkconfsmb ${dataset}
+                exit=$?
+                [ $exit -ne 0 ] && ret=1
+            ;;
+            nfs)
+                nasshare_mkconfnfs ${dataset}
+                exit=$?
+                [ $exit -ne 0 ] && ret=1
+            ;;
+            ftp)
+                nasshare_mkconfftp ${dataset}
+                exit=$?
+                [ $exit -ne 0 ] && ret=1
+            ;;
+            rsync)
+                nasshare_mkconfrsync ${dataset}
+                exit=$?
+                [ $exit -ne 0 ] && ret=1
+            ;;
+            http)
+                nasshare_mkconfhttp ${dataset}
+                exit=$?
+                [ $exit -ne 0 ] && ret=1
+            ;;
+            *)
+                return 1
+            ;;
+        esac
+    done
+
+    return $ret
+}
+
+nasshare_rmconf()
+{
+    local dataset=$1
+    local protocolsname=$2
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="$NAS_SHARES${poolname}-${sharename}"
+    local ret=0
+
+    if [ ! -f ${nassharefile} ]; then
+        return 1
+    fi
+    
+    if [ -z "$protocolsname" ];then
+        protocolsname="smb nfs ftp rsync http"
+    else
+        protocolsname="`echo $protocolsname | sed "s/,/ /g"`"
+    fi
+    
+    for protocolname in $protocolsname
+    do
+        case "$protocolname" in
+            smb)
+                nasshare_rmconfsmb ${dataset}
+                exit=$?
+                [ $exit -ne 0 ] && ret=1
+            ;;
+            nfs)
+                nasshare_rmconfnfs ${dataset}
+                exit=$?
+                [ $exit -ne 0 ] && ret=1
+            ;;
+            ftp)
+                nasshare_rmconfftp ${dataset}
+                exit=$?
+                [ $exit -ne 0 ] && ret=1
+            ;;
+            rsync)
+                nasshare_rmconfrsync ${dataset}
+                exit=$?
+                [ $exit -ne 0 ] && ret=1
+            ;;
+            http)
+                nasshare_rmconfhttp ${dataset}
+                exit=$?
+                [ $exit -ne 0 ] && ret=1
+            ;;
+            *)
+                return 1
+            ;;
+        esac
+    done
+
+    return $ret
+}
+
+# function nasshare_enable
+# {
+    # local protocolname=$1
+    # local dataset=$2
+    # local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    # local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    # local nassharefile="$NAS_SHARES${poolname}-${sharename}"
+
+    # if [ ! -f ${nassharefile} ]; then
+        # return 1
+    # fi
+
+    # case "$protocolname" in
+        # smb)
+            # $CFG_FILE set_var ${nassharefile} "SMB" "1" 2>/dev/null
+            # nasshare_mkconfsmb ${dataset}
+            # exit=$?
+            # if [ $exit -eq 0 ]; then
+                # $NSH_EVENT logevent "NASSHARE_DIR_STARTSMB" "php" "$dataset"
+            # fi
+
+            # nsync
+
+            # return $exit
+        # ;;
+        # nfs)
+            # $CFG_FILE set_var ${nassharefile} "NFS" "1" 2>/dev/null
+            # nasshare_mkconfnfs ${dataset}
+            # exit=$?
+            # if [ $exit -eq 0 ]; then
+                # $NSH_EVENT logevent "NASSHARE_DIR_STARTNFS" "php" "$dataset"
+            # fi
+
+            # nsync
+
+            # return $exit
+        # ;;
+        # ftp)
+            # $CFG_FILE set_var ${nassharefile} "FTP" "1" 2>/dev/null
+            # nasshare_mountftpshare ${dataset}
+            # local exit=$?
+            # [ "$exit" -ne 0 ] && return $exit
+            # nasshare_mkconfftp ${dataset}
+            # exit=$?
+            # if [ $exit -eq 0 ]; then
+                # $NSH_EVENT logevent "NASSHARE_DIR_STARTFTP" "php" "$dataset"
+            # fi
+
+            # nsync
+
+            # return $exit
+        # ;;
+        # rsync)
+            # $CFG_FILE set_var ${nassharefile} "RSYNC" "1" 2>/dev/null
+            # nasshare_mkconfrsync ${dataset}
+            # exit=$?
+            # if [ $exit -eq 0 ]; then
+                # $NSH_EVENT logevent "NASSHARE_DIR_STARTRSYNC" "php" "$dataset"
+            # fi
+
+            # nsync
+
+            # return $exit
+        # ;;
+        # http)
+            # $CFG_FILE set_var ${nassharefile} "HTTP" "1" 2>/dev/null
+            # $CFG_FILE set_var ${nassharefile} "HTTP_ACCESS" "1" HTTP 2>/dev/null
+            # nasshare_mkconfhttp ${dataset}
+            # exit=$?
+            # if [ $exit -eq 0 ]; then
+                # $NSH_EVENT logevent "NASSHARE_DIR_STARTHTTP" "php" "$dataset"
+            # fi
+
+            # nsync
+
+            # return $exit
+        # ;;
+        # *)
+            # return 1
+        # ;;
+    # esac
+
+    # return $?
+# }
+
+nasshare_enable()
+{
+    local dataset=$1
+    local protocolsname=$2
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="$NAS_SHARES${poolname}-${sharename}"
+    local ret=0
+
+    if [ ! -f ${nassharefile} ]; then
+        return 1
+    fi
+    
+    if [ -z "$protocolsname" ];then
+        protocolsname="smb nfs ftp rsync http"
+    else
+        protocolsname="`echo $protocolsname | sed "s/,/ /g"`"
+    fi
+    
+    for protocolname in $protocolsname
+    do
+        case "$protocolname" in
+            smb)
+                $CFG_FILE set_var ${nassharefile} "SMB" "1" 2>/dev/null
+                nasshare_mkconf ${dataset} smb
+                exit=$?
+                if [ $exit -eq 0 ]; then
+                    $NSH_EVENT logevent "NASSHARE_DIR_STARTSMB" "php" "$dataset"
+                else
+                    ret=1
+                fi
+            ;;
+            nfs)
+                $CFG_FILE set_var ${nassharefile} "NFS" "1" 2>/dev/null
+                nasshare_mkconf ${dataset} nfs
+                exit=$?
+                if [ $exit -eq 0 ]; then
+                    $NSH_EVENT logevent "NASSHARE_DIR_STARTNFS" "php" "$dataset"
+                else
+                    ret=1
+                fi
+            ;;
+            ftp)
+                $CFG_FILE set_var ${nassharefile} "FTP" "1" 2>/dev/null
+                nasshare_mountftpshare ${dataset}
+                exit=$?
+                [ "$exit" -ne 0 ] && continue
+                nasshare_mkconf ${dataset} ftp
+                exit=$?
+                if [ $exit -eq 0 ]; then
+                    $NSH_EVENT logevent "NASSHARE_DIR_STARTFTP" "php" "$dataset"
+                else
+                    ret=1
+                fi
+            ;;
+            rsync)
+                $CFG_FILE set_var ${nassharefile} "RSYNC" "1" 2>/dev/null
+                nasshare_mkconf ${dataset} rsync
+                exit=$?
+                if [ $exit -eq 0 ]; then
+                    $NSH_EVENT logevent "NASSHARE_DIR_STARTRSYNC" "php" "$dataset"
+                else
+                    ret=1
+                fi
+            ;;
+            http)
+                $CFG_FILE set_var ${nassharefile} "HTTP" "1" 2>/dev/null
+                $CFG_FILE set_var ${nassharefile} "HTTP_ACCESS" "1" HTTP 2>/dev/null
+                nasshare_mkconf ${dataset} http
+                exit=$?
+                if [ $exit -eq 0 ]; then
+                    $NSH_EVENT logevent "NASSHARE_DIR_STARTHTTP" "php" "$dataset"
+                else
+                    ret=1
+                fi
+            ;;
+            *)
+                continue
+            ;;
+        esac
+    done
+
+    return $ret
+}
+
+# function nasshare_disable
+# {
+    # local protocolname=$1
+    # local dataset=$2
+    # local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    # local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    # local nassharefile="$NAS_SHARES${poolname}-${sharename}"
+
+    # if [ ! -f ${nassharefile} ]; then
+        # return 1
+    # fi
+
+    # case "$protocolname" in
+        # smb)
+            # nasshare_rmconfsmb ${dataset}
+            # $CFG_FILE set_var ${nassharefile} "SMB" "0" 2>/dev/null
+            # exit=$?
+            # if [ $exit -eq 0 ]; then
+                # $NSH_EVENT logevent "NASSHARE_DIR_STOPSMB" "php" "$dataset"
+            # fi
+
+            # nsync
+
+            # return $exit
+        # ;;
+        # nfs)
+            # nasshare_rmconfnfs ${dataset}
+            # $CFG_FILE set_var ${nassharefile} "NFS" "0" 2>/dev/null
+            # exit=$?
+            # if [ $exit -eq 0 ]; then
+                # $NSH_EVENT logevent "NASSHARE_DIR_STOPNFS" "php" "$dataset"
+            # fi
+
+            # nsync
+
+            # return $exit
+        # ;;
+        # ftp)
+            # nasshare_umountftpshare ${dataset}
+            # ret=$?
+            # if [ $ret -ne 0 ]; then
+                # return $ret
+            # fi
+            # nasshare_rmconfftp ${dataset}
+            # $CFG_FILE set_var ${nassharefile} "FTP" "0" 2>/dev/null
+            # exit=$?
+            # if [ $exit -eq 0 ]; then
+                # $NSH_EVENT logevent "NASSHARE_DIR_STOPFTP" "php" "$dataset"
+            # fi
+
+            # nsync
+
+            # return $exit
+        # ;;
+        # rsync)
+            # $CFG_FILE set_var ${nassharefile} "RSYNC" "0" 2>/dev/null
+            # nasshare_mkconfrsync ${dataset}
+            # exit=$?
+            # if [ $exit -eq 0 ]; then
+                # $NSH_EVENT logevent "NASSHARE_DIR_STOPRSYNC" "php" "$dataset"
+            # fi
+
+            # nsync
+
+            # return $exit
+        # ;;
+        # http)
+            # $CFG_FILE set_var ${nassharefile} "HTTP" "0" 2>/dev/null
+            # $CFG_FILE set_var ${nassharefile} "HTTP_ACCESS" "0" HTTP 2>/dev/null
+            # nasshare_mkconfhttp ${dataset}
+            # exit=$?
+            # if [ $exit -eq 0 ]; then
+                # $NSH_EVENT logevent "NASSHARE_DIR_STOPHTTP" "php" "$dataset"
+            # fi
+
+            # nsync
+
+            # return $exit
+        # ;;
+        # *)
+            # return 1
+        # ;;
+    # esac
+
+    # return $?
+# }
+
+nasshare_disable()
+{
+    local dataset=$1
+    local protocolsname=$2
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="$NAS_SHARES${poolname}-${sharename}"
+    local ret=0
+
+    if [ ! -f ${nassharefile} ]; then
+        return 1
+    fi
+    
+    if [ -z "$protocolsname" ];then
+        protocolsname="smb nfs ftp rsync http"
+    else
+        protocolsname="`echo $protocolsname | sed "s/,/ /g"`"
+    fi
+    
+    for protocolname in $protocolsname
+    do
+        case "$protocolname" in
+            smb)
+                nasshare_rmconf ${dataset} smb
+                $CFG_FILE set_var ${nassharefile} "SMB" "0" 2>/dev/null
+                exit=$?
+                if [ $exit -eq 0 ]; then
+                    $NSH_EVENT logevent "NASSHARE_DIR_STOPSMB" "php" "$dataset"
+                else
+                    ret=1
+                fi
+            ;;
+            nfs)
+                nasshare_rmconf ${dataset} nfs
+                $CFG_FILE set_var ${nassharefile} "NFS" "0" 2>/dev/null
+                exit=$?
+                if [ $exit -eq 0 ]; then
+                    $NSH_EVENT logevent "NASSHARE_DIR_STOPNFS" "php" "$dataset"
+                else
+                    ret=1
+                fi
+            ;;
+            ftp)
+                nasshare_umountftpshare ${dataset}
+                exit=$?
+                if [ "$exit" -ne 0 ];then
+                    ret=1
+                    continue
+                fi
+                nasshare_rmconf ${dataset} ftp
+                $CFG_FILE set_var ${nassharefile} "FTP" "0" 2>/dev/null
+                exit=$?
+                if [ $exit -eq 0 ]; then
+                    $NSH_EVENT logevent "NASSHARE_DIR_STOPFTP" "php" "$dataset"
+                else
+                    ret=1
+                fi
+            ;;
+            rsync)
+                $CFG_FILE set_var ${nassharefile} "RSYNC" "0" 2>/dev/null
+                nasshare_mkconf ${dataset} rsync
+                exit=$?
+                if [ $exit -eq 0 ]; then
+                    $NSH_EVENT logevent "NASSHARE_DIR_STOPRSYNC" "php" "$dataset"
+                else
+                    ret=1
+                fi
+            ;;
+            http)
+                $CFG_FILE set_var ${nassharefile} "HTTP" "0" 2>/dev/null
+                $CFG_FILE set_var ${nassharefile} "HTTP_ACCESS" "0" HTTP 2>/dev/null
+                nasshare_mkconf ${dataset} http
+                exit=$?
+                if [ $exit -eq 0 ]; then
+                    $NSH_EVENT logevent "NASSHARE_DIR_STOPHTTP" "php" "$dataset"
+                else
+                    ret=1
+                fi
+            ;;
+            *)
+                continue
+            ;;
+        esac
+    done
+    
+    return $ret
+}
+
+nasshare_active()
+{
+    local exit=0
+    local dataset=$1
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local sharefile="$NAS_SHARES${poolname}-${sharename}"
+    local sharesmbenabled sharenfsenabled shareftpenabled sharersyncenabled sharehttpenabled
+    local protocolsname
+    
+    [ ! -f "$sharefile" ] && return $exit
+    sharesmbenabled="`$CFG_FILE get_var \"$sharefile\" SMB`"
+    sharenfsenabled="`$CFG_FILE get_var \"$sharefile\" NFS`"
+    shareftpenabled="`$CFG_FILE get_var \"$sharefile\" FTP`"
+    sharersyncenabled="`$CFG_FILE get_var \"$sharefile\" RSYNC`"
+    sharehttpenabled="`$CFG_FILE get_var \"$sharefile\" HTTP`"
+    
+    [ $sharesmbenabled -eq 1 ] && protocolsname=$protocolsname",smb"
+    [ $sharenfsenabled -eq 1 ] && protocolsname=$protocolsname",nfs"
+    [ $shareftpenabled -eq 1 ] && protocolsname=$protocolsname",ftp"
+    [ $sharersyncenabled -eq 1 ] && protocolsname=$protocolsname",rsync"
+    [ $sharehttpenabled -eq 1 ] && protocolsname=$protocolsname",http"
+    
+    protocolsname="`echo $protocolsname | sed "s/^,//g"`"
+    
+    if [ ! -z "$protocolsname" ];then
+        if [[ "$protocolsname" =~ "ftp" ]];then
+            nasshare_mountftpshare ${dataset}
+            exit=$?
+            [ "$exit" -ne 0 ] && return $exit
+        fi
+        nasshare_mkconf $dataset $protocolsname
+        exit=$?
+    fi
+    return $exit
+}
+
+nasshare_inactive()
+{
+    local exit=0
+    local dataset=$1
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local sharefile="$NAS_SHARES${poolname}-${sharename}"
+    local sharesmbenabled sharenfsenabled shareftpenabled sharersyncenabled sharehttpenabled
+    local protocolsname
+    
+    [ ! -f "$sharefile" ] && return $exit
+    sharesmbenabled="`$CFG_FILE get_var \"$sharefile\" SMB`"
+    sharenfsenabled="`$CFG_FILE get_var \"$sharefile\" NFS`"
+    shareftpenabled="`$CFG_FILE get_var \"$sharefile\" FTP`"
+    sharersyncenabled="`$CFG_FILE get_var \"$sharefile\" RSYNC`"
+    sharehttpenabled="`$CFG_FILE get_var \"$sharefile\" HTTP`"
+    
+    [ $sharesmbenabled -eq 1 ] && protocolsname=$protocolsname",smb"
+    [ $sharenfsenabled -eq 1 ] && protocolsname=$protocolsname",nfs"
+    [ $shareftpenabled -eq 1 ] && protocolsname=$protocolsname",ftp"
+    [ $sharersyncenabled -eq 1 ] && protocolsname=$protocolsname",rsync"
+    [ $sharehttpenabled -eq 1 ] && protocolsname=$protocolsname",http"
+    
+    protocolsname="`echo $protocolsname | sed "s/^,//g"`"
+    
+    if [ ! -z "$protocolsname" ];then
+        if [[ "$protocolsname" =~ "ftp" ]];then
+            nasshare_umountftpshare ${dataset}
+            exit=$?
+            [ "$exit" -ne 0 ] && return $exit
+        fi
+        nasshare_rmconf $dataset $protocolsname
+        exit=$?
+    fi
+    return $exit
+}
+
+nasshare_getaccesssmb()
+{
+    local exit=0
+    local dataset=$1
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="$NAS_SHARES${poolname}-${sharename}"
+
+    SMB_USE="`${CFG_FILE} get_var \"${nassharefile}\" SMB`"
+    ACTIVE="`${CFG_FILE} get_var \"${nassharefile}\" ACTIVE`"
+    SHARE_PATH="`${CFG_FILE} get_var \"${nassharefile}\" PATH`"
+    COMMENT="`${CFG_FILE} get_var \"${nassharefile}\" COMMENT`"
+    RO="`${CFG_FILE} get_var \"${nassharefile}\" RO \"SMB\"`"
+    VISIBLE="`${CFG_FILE} get_var \"${nassharefile}\" VISIBLE \"SMB\"`"
+    ACCESS="`${CFG_FILE} get_var \"${nassharefile}\" ACCESS \"SMB\"`"
+    ALLOW_IP="`${CFG_FILE} get_var \"${nassharefile}\" ALLOW_IP \"SMB\"`"
+    DENY_IP="`${CFG_FILE} get_var \"${nassharefile}\" DENY_IP \"SMB\"`"
+
+    ALLOW_USERS="`${CFG_FILE} get_var \"${nassharefile}\" ALLOW_USERS \"SMB\"`"
+    local userFile=`mktemp`
+    local tmpFile=`mktemp`
+    $NSH_NASUSER list > $userFile
+    echo $ALLOW_USERS | awk -F "," '{for(i=1;i<=NF;i++)print $i;}' | while read USER
+        do
+            local tmpUser=`awk -v name="$USER" '{if($0==name)print $0;}' $userFile`
+            [ -n "$tmpUser" ] && echo -n ",$tmpUser" >> $tmpFile
+        done
+    rm -f $userFile
+    ALLOW_USERS=`sed 's/^,//' $tmpFile`
+
+    ALLOW_GROUPS="`${CFG_FILE} get_var \"${nassharefile}\" ALLOW_GROUPS \"SMB\"`"
+    local groupFile=`mktemp`
+    > $tmpFile
+    $NSH_NASGROUP list > $groupFile
+    echo $ALLOW_GROUPS| awk -F "," '{for(i=1;i<=NF;i++)print $i;}' | while read GROUP
+        do
+            local tmpGroup=`awk -v name="$GROUP" '{if($0==name)print $0;}' $groupFile`
+            [ -n "$tmpGroup" ] && echo -n ",$tmpGroup" >> $tmpFile
+        done
+    rm -f $groupFile
+    ALLOW_GROUPS=`sed 's/^,//' $tmpFile`
+    rm -f $tmpFile
+
+    FORCE_USER_ENABLED="`${CFG_FILE} get_var \"${nassharefile}\" FORCE_USER_ENABLED \"SMB\"`"
+    FORCE_USER="`${CFG_FILE} get_var \"${nassharefile}\" FORCE_USER \"SMB\"`"
+    FORCE_GROUP_ENABLED="`${CFG_FILE} get_var \"${nassharefile}\" FORCE_GROUP_ENABLED \"SMB\"`"
+    FORCE_GROUP="`${CFG_FILE} get_var \"${nassharefile}\" FORCE_GROUP \"SMB\"`"
+    LARGE_DIR="`${CFG_FILE} get_var \"${nassharefile}\" LARGE_DIR \"SMB\"`"
+    CASE="`${CFG_FILE} get_var \"${nassharefile}\" CASE \"SMB\"`"
+
+    echo "share_name=${sharename}"
+    echo "share_smbuse=${SMB_USE}"
+    echo "share_path=${SHARE_PATH}"
+    echo "share_comment=${COMMENT}"
+    echo "share_readonly=${RO}"
+    echo "share_browseable=${VISIBLE}"
+    echo "share_guestaccess=${ACCESS}"
+    echo "share_allowusers=${ALLOW_USERS}"
+    echo "share_allowgroups=${ALLOW_GROUPS}"
+    echo "share_casesensitive=${LARGE_DIR}"
+    echo "share_defaultcase=${CASE}"
+    echo "share_allowip=${ALLOW_IP}"
+    echo "share_denyip=${DENY_IP}"
+
+    return $exit
+}
+
+nasshare_getaccessnfs()
+{
+    local exit=0
+    local dataset=$1
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="$NAS_SHARES${poolname}-${sharename}"
+
+    NFS_USE="`${CFG_FILE} get_var \"${nassharefile}\" NFS`"
+    ACTIVE="`${CFG_FILE} get_var \"${nassharefile}\" ACTIVE`"
+    SHARE_PATH="`$CFG_FILE get_var \"${nassharefile}\" PATH`"
+    INSECURE="`$CFG_FILE get_var \"${nassharefile}\" INSECURE NFS`"
+    SYNCHRONOUS="`$CFG_FILE get_var \"${nassharefile}\" SYNCHRONOUS NFS`"
+    INSECURE_LOCKS="`$CFG_FILE get_var \"${nassharefile}\" INSECURE_LOCKS NFS`"
+    ALL_SQUASH="`$CFG_FILE get_var \"${nassharefile}\" ALL_SQUASH NFS`"
+    NO_ROOT_SQUASH="`$CFG_FILE get_var \"${nassharefile}\" NO_ROOT_SQUASH NFS`"
+    ACCESS_IP="`$CFG_FILE get_var \"${nassharefile}\" ACCESS_IP NFS`"
+    WRITE_IP="`$CFG_FILE get_var \"${nassharefile}\" WRITE_IP NFS`"
+    USER_SQUASH="`$CFG_FILE get_var \"${nassharefile}\" USER_SQUASH NFS`"
+    GROUP_SQUASH="`$CFG_FILE get_var \"${nassharefile}\" GROUP_SQUASH NFS`"
+    ANONUID="`$CFG_FILE get_var \"${nassharefile}\" ANONUID NFS`"
+    ANONGID="`$CFG_FILE get_var \"${nassharefile}\" ANONGID NFS`"
+
+    echo "share_name=${sharename}"
+    echo "share_nfsuse=${NFS_USE}"
+    echo "share_path=${SHARE_PATH}"
+    echo "share_comment=${COMMENT}"
+    echo "share_insecure=${INSECURE}"
+    echo "share_synchronous=${SYNCHRONOUS}"
+    echo "share_insecurelocks=${INSECURE_LOCKS}"
+    echo "share_allsquash=${ALL_SQUASH}"
+    echo "share_norootsquash=${NO_ROOT_SQUASH}"
+    echo "share_accessip=${ACCESS_IP}"
+    echo "share_writeip=${WRITE_IP}"
+    echo "share_usersquash=${USER_SQUASH}"
+    echo "share_groupsquash=${GROUP_SQUASH}"
+    echo "share_anonuid=${ANONUID}"
+    echo "share_anongid=${ANONGID}"
+
+    return $exit
+}
+
+nasshare_getaccessftp()
+{
+    local exit=0
+    local dataset=$1
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="$NAS_SHARES${poolname}-${sharename}"
+    local SHARE="${poolname}-${sharename}"
+
+    FTP_USE="`${CFG_FILE} get_var \"${nassharefile}\" FTP`"
+    SHARE_PATH="`${CFG_FILE} get_var \"${nassharefile}\" PATH`"
+    RO="`${CFG_FILE} get_var \"${nassharefile}\" RO FTP`"
+    MODE="`${CFG_FILE} get_var \"${nassharefile}\" MODE FTP`"
+    ACCESS_IP="`$CFG_FILE get_var \"${nassharefile}\" ACCESS_IP FTP`"
+    WRITE_IP="`$CFG_FILE get_var \"${nassharefile}\" WRITE_IP FTP`"
+
+    ALLOW_USERS="`${CFG_FILE} get_var \"${nassharefile}\" ALLOW_USERS FTP`"
+    local userFile=`mktemp`
+    local tmpFile=`mktemp`
+    $NSH_NASUSER list > $userFile
+    echo $ALLOW_USERS | awk -F "," '{for(i=1;i<=NF;i++)print $i;}' | while read USER
+        do
+            local tmpUser=`awk -v name="$USER" '{if($0==name)print $0;}' $userFile`
+            [ -n "$tmpUser" ] && echo -n ",$tmpUser" >> $tmpFile
+        done
+    rm -f $userFile
+    ALLOW_USERS=`sed 's/^,//' $tmpFile`
+
+    ALLOW_GROUPS="`${CFG_FILE} get_var \"${nassharefile}\" ALLOW_GROUPS FTP`"
+    local groupFile=`mktemp`
+    > $tmpFile
+    $NSH_NASGROUP list > $groupFile
+    echo $ALLOW_GROUPS| awk -F "," '{for(i=1;i<=NF;i++)print $i;}' | while read GROUP
+        do
+            local tmpGroup=`awk -v name="$GROUP" '{if($0==name)print $0;}' $groupFile`
+            [ -n "$tmpGroup" ] && echo -n ",$tmpGroup" >> $tmpFile
+        done
+    rm -f $groupFile
+    ALLOW_GROUPS=`sed 's/^,//' $tmpFile`
+    rm -f $tmpFile
+
+    echo "share_name=${SHARE}"
+    echo "share_ftpuse=${FTP_USE}"
+    echo "share_readonly=${RO}"
+    echo "share_mode=${MODE}"
+    echo "share_accessip=${ACCESS_IP}"
+    echo "share_writeip=${WRITE_IP}"
+    echo "share_allowusers=${ALLOW_USERS}"
+    echo "share_allowgroups=${ALLOW_GROUPS}"
+
+    return $exit
+}
+
+nasshare_getaccessrsync()
+{
+    local exit=0
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="${NAS_SHARES}${poolname}-${sharename}"
+    local SHARE="${poolname}-${sharename}"
+
+    RSYNC_USE="`${CFG_FILE} get_var \"${nassharefile}\" RSYNC`"
+    SHARE_PATH="`$CFG_FILE get_var \"${nassharefile}\" PATH`"
+    RSYNC_ANONYMOU="`$CFG_FILE get_var \"${nassharefile}\" ANONYMOU RSYNC`"
+    RSYNC_USERS="`$CFG_FILE get_var \"${nassharefile}\" ALLOW_USERS RSYNC`"
+    ACCESS_IP="`$CFG_FILE get_var \"${nassharefile}\" ACCESS_IP RSYNC`"
+    ACCESS_RO="`$CFG_FILE get_var \"${nassharefile}\" RO RSYNC`"
+    LIST="`$CFG_FILE get_var \"${nassharefile}\" LIST RSYNC`"
+
+    local userFile=`mktemp`
+    local tmpFile=`mktemp`
+    $NSH_NASUSER list > $userFile
+    echo $RSYNC_USERS | awk -F "," '{for(i=1;i<=NF;i++)print $i;}' | while read USER
+        do
+            local tmpUser=`awk -v name="$USER" '{if($0==name)print $0;}' $userFile`
+            [ -n "$tmpUser" ] && echo -n ",$tmpUser" >> $tmpFile
+        done
+    rm -f $userFile
+    RSYNC_USERS=`sed 's/^,//' $tmpFile`
+
+    echo "share_name=${SHARE}"
+    echo "share_rsyncuse=${RSYNC_USE}"
+    echo "share_path=${SHARE_PATH}"
+    echo "share_rsyncanonymou=${RSYNC_ANONYMOU}"
+    echo "share_allowusers=${RSYNC_USERS}"
+    echo "share_accessip=${ACCESS_IP}"
+    echo "share_readonly=${ACCESS_RO}"
+    echo "share_list=${LIST}"
+}
+
+nasshare_getaccesshttp()
+{
+    local exit=0
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="${NAS_SHARES}${poolname}-${sharename}"
+    local SHARE="${poolname}-${sharename}"
+
+    HTTP_ACCESS="`$CFG_FILE get_var \"${nassharefile}\" HTTP_ACCESS HTTP`"
+
+    echo "share_name=${SHARE}"
+    echo "share_httpuse=${HTTP_ACCESS}"
+}
+
+nasshare_getaccess()
+{
+    local protocolname=$1
+    local dataset=$2
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="$NAS_SHARES${poolname}-${sharename}"
+
+    if [ ! -f ${nassharefile} ]; then
+        return 1
+    fi
+
+    case "$protocolname" in
+        smb)
+            nasshare_getaccesssmb $dataset
+            return $?
+        ;;
+        nfs)
+            nasshare_getaccessnfs $dataset
+            return $?
+        ;;
+        ftp)
+            nasshare_getaccessftp $dataset
+            return $?
+        ;;
+        rsync)
+            nasshare_getaccessrsync $dataset
+            return $?
+        ;;
+        http)
+            nasshare_getaccesshttp $dataset
+            return $?
+        ;;
+        *)
+            return 1
+        ;;
+    esac
+
+    return $?
+}
+
+nasshare_setaccesssmb()
+{
+    local exit=0
+    local dataset=$1
+    local settings="$2"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="$NAS_SHARES${poolname}-${sharename}"
+
+    #echo "SMB=1;RO=0;WRITE_IP=;VISIBLE=1;ACCESS=1;ALLOW_USERS=;ALLOW_GROUPS=;LARGE_DIR:=" | awk -F ';' '{ print NF }'
+    setcount=`echo "$settings" | awk -F ';' '{ print NF }'`
+    for ((i=$setcount;i>=1;i--)); do
+        setting=`echo "${settings}" | cut -d ';' -f $i`
+        optcount=`echo "${setting}" | awk -F '=' '{ print NF }'`
+        if [ "$optcount" = "2" ]; then
+            setkey=`echo "${setting}" | cut -d '=' -f 1 | tr '[a-z]' '[A-Z]'`
+            setvalue=`echo "${setting}" | cut -d '=' -f 2`
+            echo "key=$setkey ,value=$setvalue"
+            case "$setkey" in
+                SMB)
+                    $CFG_FILE set_var ${nassharefile} "$setkey" "$setvalue" 2>/dev/null
+                ;;
+                RO|ALLOW_IP|DENY_IP|VISIBLE|ACCESS|ALLOW_USERS|ALLOW_GROUPS|LARGE_DIR|CASE)
+                    $CFG_FILE set_var ${nassharefile} "$setkey" "$setvalue" SMB 2>/dev/null
+                ;;
+                *)
+                    #$CFG_FILE set_var ${nassharefile} "$setkey" "$setvalue" SMB 2>/dev/null
+                    :
+                ;;
+            esac
+        fi
+    done
+
+    return $exit
+}
+
+nasshare_setaccessnfs()
+{
+    local exit=0
+    local dataset=$1
+    local settings="$2"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="$NAS_SHARES${poolname}-${sharename}"
+
+    #echo "NFS=1;ACCESS_IP=;WRITE_IP=;INSECURE=0;SYNCHRONOUS=0;INSECURE_LOCKS=0;ALL_SQUASH=0;NO_ROOT_SQUASH=1" | awk -F ';' '{ print NF }'
+    #NFS=1;ACCESS_IP=192.168.0.1;WRITE_IP=;INSECURE=1;SYNCHRONOUS=0;INSECURE_LOCKS=0;ALL_SQUASH=0;NO_ROOT_SQUASH=1;USER_SQUASH=root;GROUP_SQUASH=root;ANONUID=0;ANONGID=0
+    setcount=`echo "$settings" | awk -F ';' '{ print NF }'`
+    for ((i=$setcount;i>=1;i--)); do
+        setting=`echo "${settings}" | cut -d ';' -f $i`
+        optcount=`echo "${setting}" | awk -F '=' '{ print NF }'`
+        if [ "$optcount" = "2" ]; then
+            setkey=`echo "${setting}" | cut -d '=' -f 1 | tr '[a-z]' '[A-Z]'`
+            setvalue=`echo "${setting}" | cut -d '=' -f 2`
+            echo "key=$setkey ,value=$setvalue"
+            case "$setkey" in
+                NFS)
+                    $CFG_FILE set_var ${nassharefile} "$setkey" "$setvalue" 2>/dev/null
+                ;;
+                ACCESS_IP|WRITE_IP|INSECURE|SYNCHRONOUS|INSECURE_LOCKS|ALL_SQUASH|NO_ROOT_SQUASH|USER_SQUASH|GROUP_SQUASH|ANONUID|ANONGID)
+                    $CFG_FILE set_var ${nassharefile} "$setkey" "$setvalue" NFS 2>/dev/null
+                ;;
+                *)
+                    #$CFG_FILE set_var ${nassharefile} "$setkey" "$setvalue" NFS 2>/dev/null
+                    :
+                ;;
+            esac
+        fi
+    done
+
+    return $exit
+}
+
+nasshare_setaccessftp()
+{
+    local exit=0
+    local dataset=$1
+    local settings="$2"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="$NAS_SHARES${poolname}-${sharename}"
+    local SHARE="${poolname}-${sharename}"
+    local mode=`echo "$settings" | cut -d ';' -f 3 | awk -F '=' '{print $2}'`
+
+    #if [ "$mode" = "$FTP_MODE_ANONYMOUS" ]; then 
+    #    if [ -z "`${MOUNT} | awk -v shareMountPoint=\"${FTP_ANONYMOUS_PATH}/${SHARE}\" '{if($3==shareMountPoint) print $3;}'`" ]; then
+    #        if [ -n "`${MOUNT} | awk -v shareMountPoint=\"${FTP_USER_PATH}/${SHARE}\" '{if($3==shareMountPoint) print $3;}'`" ]; then
+    #            local ret=0
+    #            fuser ${FTP_USER_PATH}/${SHARE} >/dev/null 2>&1
+    #            ret=$?
+    #            if [ $ret -eq 0 ]; then
+    #                return $FTP_UMOUNT_FAILED
+    #            fi
+    #        fi
+    #    fi
+    #elif [ "$mode" = "$FTP_MODE_USER" ]; then
+    #    if [ -z "`${MOUNT} | awk -v shareMountPoint=\"${FTP_USER_PATH}/${SHARE}\" '{if($3==shareMountPoint) print $3;}'`" ]; then
+    #        if [ -n "`${MOUNT} | awk -v shareMountPoint=\"${FTP_ANONYMOUS_PATH}/${SHARE}\" '{if($3==shareMountPoint) print $3;}'`" ]; then
+    #            local ret=0
+    #            fuser ${FTP_ANONYMOUS_PATH}/${SHARE} >/dev/null 2>&1
+    #            ret=$?
+    #            if [ $ret -eq 0 ]; then
+    #                return $FTP_UMOUNT_FAILED
+    #            fi
+    #        fi
+    #    fi
+    #fi
+
+    #FTP=1;RO=0;MODE=anony;ACCESS_IP=;WRITE_IP=;ALLOW_USERS=;ALLOW_GROUPS=;
+    setcount=`echo "$settings" | awk -F ';' '{ print NF }'`
+    for ((i=$setcount;i>=1;i--)); do
+        setting=`echo "${settings}" | cut -d ';' -f $i`
+        optcount=`echo "${setting}" | awk -F '=' '{ print NF }'`
+        if [ "$optcount" = "2" ]; then
+            setkey=`echo "${setting}" | cut -d '=' -f 1 | tr '[a-z]' '[A-Z]'`
+            setvalue=`echo "${setting}" | cut -d '=' -f 2`
+            case "$setkey" in
+                FTP)
+                    $CFG_FILE set_var ${nassharefile} "$setkey" "$setvalue" 2>/dev/null
+                ;;
+                RO|MODE|WRITE_IP|ACCESS_IP|ALLOW_USERS|ALLOW_GROUPS)
+                    $CFG_FILE set_var ${nassharefile} "$setkey" "$setvalue" FTP 2>/dev/null
+                ;;
+                *)
+                    #$CFG_FILE set_var ${nassharefile} "$setkey" "$setvalue" SMB 2>/dev/null
+                    :
+                ;;
+            esac
+        fi
+    done
+
+    return $exit
+}
+
+nasshare_setaccessrsync()
+{
+    local exit=0
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="${NAS_SHARES}${poolname}-${sharename}"
+    local settings="$2"
+
+    #RSYNC=1;ANONYMOU=;ALLOW_USERS=;RO=;ACCESS_IP=;LIST=;
+    setcount=`echo "$settings" | awk -F ';' '{ print NF }'`
+    for ((i=$setcount;i>=1;i--)); do
+        setting=`echo "${settings}" | cut -d ';' -f $i`
+        optcount=`echo "${setting}" | awk -F '=' '{ print NF }'`
+        if [ "$optcount" = "2" ]; then
+            setkey=`echo "${setting}" | cut -d '=' -f 1 | tr '[a-z]' '[A-Z]'`
+            setvalue=`echo "${setting}" | cut -d '=' -f 2`
+            case "$setkey" in
+                RSYNC)
+                    $CFG_FILE set_var ${nassharefile} "$setkey" "$setvalue" 2>/dev/null
+                ;;
+                ANONYMOU|ALLOW_USERS|RO|ACCESS_IP|LIST)
+                    $CFG_FILE set_var ${nassharefile} "$setkey" "$setvalue" RSYNC 2>/dev/null
+                ;;
+                *)
+                    #$CFG_FILE set_var ${nassharefile} "$setkey" "$setvalue" SMB 2>/dev/null
+                    :
+                ;;
+            esac
+        fi
+    done
+
+    return $exit
+}
+
+nasshare_setaccesshttp()
+{
+    local exit=0
+    local dataset="$1"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="${NAS_SHARES}${poolname}-${sharename}"
+    local settings="$2"
+
+    #HTTP_ACCESS=1;
+    setcount=`echo "$settings" | awk -F ';' '{ print NF }'`
+    for ((i=$setcount;i>=1;i--)); do
+        setting=`echo "${settings}" | cut -d ';' -f $i`
+        optcount=`echo "${setting}" | awk -F '=' '{ print NF }'`
+        if [ "$optcount" = "2" ]; then
+            setkey=`echo "${setting}" | cut -d '=' -f 1 | tr '[a-z]' '[A-Z]'`
+            setvalue=`echo "${setting}" | cut -d '=' -f 2`
+            case "$setkey" in
+                HTTP)
+                    $CFG_FILE set_var ${nassharefile} "$setkey" "$setvalue" 2>/dev/null
+                ;;
+                HTTP_ACCESS)
+                    $CFG_FILE set_var ${nassharefile} "$setkey" "$setvalue" HTTP 2>/dev/null
+                ;;
+                *)
+                    #$CFG_FILE set_var ${nassharefile} "$setkey" "$setvalue" SMB 2>/dev/null
+                    :
+                ;;
+            esac
+        fi
+    done
+
+    return $exit
+}
+
+nasshare_setaccess()
+{
+    local protocolname="$1"
+    local dataset=$2
+    local settings="$3"
+    local poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+    local sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+    local nassharefile="$NAS_SHARES${poolname}-${sharename}"
+
+    if [ ! -f ${nassharefile} ]; then
+        return 1
+    fi
+
+    case "$protocolname" in
+        smb)
+            nasshare_setaccesssmb $dataset "$settings"
+            exit=$?
+            if [ $exit -eq 0 ]; then
+                $NSH_EVENT logevent "NASSHARE_DIR_MODIFYSMB" "php" "$dataset"
+            fi
+
+            nsync
+
+            return $exit
+        ;;
+        nfs)
+            nasshare_setaccessnfs $dataset "$settings"
+            exit=$?
+            if [ $exit -eq 0 ]; then
+                $NSH_EVENT logevent "NASSHARE_DIR_MODIFYNFS" "php" "$dataset"
+            fi
+
+            nsync
+
+            return $exit
+        ;;
+        ftp)
+            nasshare_setaccessftp $dataset "$settings"
+            exit=$?
+            if [ $exit -eq 0 ]; then
+                $NSH_EVENT logevent "NASSHARE_DIR_MODIFYFTP" "php" "$dataset"
+            fi
+
+            nsync
+
+            return $exit
+        ;;
+        rsync)
+            nasshare_setaccessrsync $dataset "$settings"
+            exit=$?
+            if [ $exit -eq 0 ]; then
+                $NSH_EVENT logevent "NASSHARE_DIR_MODIFYRSYNC" "php" "$dataset"
+            fi
+
+            nsync
+
+            return $exit
+        ;;
+        http)
+            nasshare_setaccesshttp $dataset "$settings"
+            exit=$?
+            if [ $exit -eq 0 ]; then
+                $NSH_EVENT logevent "NASSHARE_DIR_MODIFYHTTP" "php" "$dataset"
+            fi
+
+            nsync
+
+            return $exit
+        ;;
+        *)
+            return 1
+        ;;
+    esac
+
+    return $?
+}
+
+nasshare_deleteuser()
+{
+    local username="$1"
+    while read line; do
+        if [ "$line" != "" ]; then
+            dataset="$line"
+            poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+            sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+            nassharefile="${NAS_SHARES}${poolname}-${sharename}"
+
+            old_allowusers="`${CFG_FILE} get_var ${nassharefile} ALLOW_USERS SMB`"
+            set_allowusers=$old_allowusers
+            if [ "`echo $old_allowusers|grep "\<$username\>"`" != "" ]; then
+                set_allowusers="`echo $old_allowusers | sed 's/,/\n/g' | grep -v "\<$username\>" | tr "\n" "," | sed 's/,$//'`"
+                ${CFG_FILE} set_var ${nassharefile} ALLOW_USERS "$set_allowusers" SMB 2>/dev/null
+                nasshare_mkconf $dataset smb 2>/dev/null
+            fi
+
+            all_squash="`$CFG_FILE get_var \"${nassharefile}\" ALL_SQUASH NFS`"
+            user_squash="`$CFG_FILE get_var \"${nassharefile}\" USER_SQUASH NFS`"
+            if [ $all_squash -eq 1 -a "$user_squash" = "$username" ]; then
+                $CFG_FILE set_var ${nassharefile} "USER_SQUASH" "guest" NFS 2>/dev/null
+                $CFG_FILE set_var ${nassharefile} "ANONUID" "65535" NFS 2>/dev/null
+                nasshare_mkconf $dataset nfs 2>/dev/null
+            fi
+        fi
+    done<<EOF
+`nasshare_list`
+EOF
+
+    return $?
+}
+
+nasshare_deletegroup()
+{
+    local groupname="$1"
+    while read line; do
+        if [ "$line" != "" ]; then
+            dataset="$line"
+            poolname="`echo $dataset | awk -F "/" '{print $1}'`"
+            sharename="`echo $dataset | awk -F "/" '{print $2}'`"
+            nassharefile="${NAS_SHARES}${poolname}-${sharename}"
+            
+            old_allowgroups="`${CFG_FILE} get_var ${nassharefile} ALLOW_GROUPS SMB`"
+            set_allowgroups=$old_allowgroups
+            if [ "`echo $old_allowgroups|grep "\<$groupname\>"`" != "" ]; then
+                set_allowgroups="`echo $old_allowgroups | sed 's/,/\n/g' | grep -v "\<$groupname\>" | tr "\n" "," | sed 's/,$//'`"
+                ${CFG_FILE} set_var ${nassharefile} ALLOW_GROUPS "$set_allowgroups" SMB 2>/dev/null
+                nasshare_mkconf $dataset smb 2>/dev/null
+            fi
+
+            all_squash="`$CFG_FILE get_var \"${nassharefile}\" ALL_SQUASH NFS`"
+            group_squash="`$CFG_FILE get_var \"${nassharefile}\" GROUP_SQUASH NFS`"
+            if [ $all_squash -eq 1 -a "$group_squash" = "$groupname" ]; then
+                $CFG_FILE set_var ${nassharefile} "GROUP_SQUASH" "guests" NFS 2>/dev/null
+                $CFG_FILE set_var ${nassharefile} "ANONGID" "65535" NFS 2>/dev/null
+                nasshare_mkconf $dataset nfs 2>/dev/null
+            fi
+        fi
+    done<<EOF
+`nasshare_list`
+EOF
+
+    return $?
+}
+
+action="$1"
+
+case "$action" in
+    list)
+        if [ "$#" -gt 2 -o "$#" = 2 -a "$2" != "-v" ];then
+            exit 1
+        fi
+        nasshare_list $2
+        exit $?
+    ;;
+    info)
+        shift
+        if [ "$#" != "1"  ];then
+            exit 1
+        fi
+        dataset=$1
+        nasshare_info $dataset
+        exit $?
+    ;;
+    create)
+        shift
+        if [ "$#" != "1"  ];then
+            exit 1
+        fi
+        dataset=$1
+        nasshare_create $dataset
+        exit $?
+    ;;
+    delete)
+        shift
+        if [ "$#" != "1"  ];then
+            exit 1
+        fi
+        dataset=$1
+        nasshare_delete $dataset
+        exit $?
+    ;;
+    ftpcnt)
+        shift
+        if [ "$#" != "1"  ];then
+            exit 1
+        fi
+        dataset=$1
+        nasshare_ftpcnt $dataset
+        exit $?
+    ;;
+    cnt)
+        shift
+        if [ "$#" != "1"  ];then
+            exit 1
+        fi
+        dataset=$1
+        nasshare_cnt $dataset
+        exit $?
+    ;;
+    mkconf)
+        shift
+        if [ $# -gt 2  ];then
+            exit 1
+        fi
+        dataset=$1
+        protocolsname=$2
+        nasshare_mkconf $dataset $protocolsname
+        exit $?
+    ;;
+    rmconf)
+        shift
+        if [ $# -gt 2  ];then
+            exit 1
+        fi
+        dataset=$1
+        protocolsname=$2
+        nasshare_rmconf $dataset $protocolsname
+        exit $?
+    ;;
+    getaccess)
+        if [ "$#" != "3"  ];then
+            exit 1
+        fi
+        protocolname=$2
+        dataset=$3
+        nasshare_getaccess $protocolname $dataset
+        exit $?
+    ;;
+    setaccess)
+        if [ "$#" != "4"  ];then
+            exit 1
+        fi
+        protocolname=$2
+        dataset=$3
+        settings="$4"
+        nasshare_setaccess $protocolname $dataset "$settings"
+        exit $?
+    ;;
+    deleteuser)
+        if [ "$#" != "2" ];then
+            exit 1
+        fi
+        username=$2
+        nasshare_deleteuser $username
+        exit $?
+    ;;
+    deletegroup)
+        if [ "$#" != "2"  ];then
+            exit 1
+        fi
+        groupname=$2
+        nasshare_deletegroup $groupname
+        exit $?
+    ;;
+    enable)
+        if [ $# -gt 3  ];then
+            exit 1
+        fi
+        dataset=$2
+        protocolname=$3
+        nasshare_enable $dataset $protocolname
+        exit $?
+    ;;
+    disable)
+        if [ $# -gt 3  ];then
+            exit 1
+        fi
+        dataset=$2
+        protocolname=$3
+        nasshare_disable $dataset $protocolname
+        exit $?
+    ;;
+    active)
+        if [ $# -ne 2 ];then
+            exit 1
+        fi
+        dataset=$2
+        nasshare_active $dataset
+        exit $?
+    ;;
+    inactive)
+        if [ $# -ne 2 ];then
+            exit 1
+        fi
+        dataset=$2
+        nasshare_inactive $dataset
+        exit $?
+    ;;
+    mountftpshare)
+        shift
+        nasshare_mountftpshare $@
+        exit $?
+    ;;
+    umountftpshare)
+        shift
+        nasshare_umountftpshare $@
+        exit $?
+    ;;
+    mountftpshares)
+        nasshare_mountftpshares
+        exit $?
+    ;;
+    umountftpshares)
+        nasshare_umountftpshares
+        exit $?
+    ;;
+    *)
+        help
+        exit -1
+    ;;
+esac
+
+exit 0
